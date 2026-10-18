@@ -1,0 +1,25 @@
+{
+  "backup_enabled": true,
+  "backup_time": "22:00",
+  "filter_system_cpu": true,
+  "service_alerts_enabled": {
+    "nginx.service": true,
+    "x-ui.service": true,
+    "warp-svc.service": true,
+    "jupyter.service": true,
+    "mem_bot.service": true,
+    "flashcard_bot.service": true,
+    "fail2ban.service": true
+  },
+  "ssh_alerts_enabled": false,
+  "ban_alerts_enabled": false,
+  "daily_report_enabled": true,
+  "daily_report_time": "09:00",
+  "quiet_hours_enabled": false,
+  "quiet_start": "00:00",
+  "quiet_end": "08:00",
+  "nightly_restart_enabled": false,
+  "last_seen_version": "",
+  "backup_hour": 20,
+  "service_alerts": true
+}
