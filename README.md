@@ -17,41 +17,15 @@ server_guard/
 ├── metrics_store.py     # Локальная база данных (SQLite) для сохранения истории метрик и сетевого трафика
 ├── security_tools.py    # Безопасность: отслеживание SSH-входов, ручной бан IP, интеграция с GeoIP
 ├── maintenance.py       # Обслуживание: Uptime, обновление пакетов apt, очистка диска, журналы служб
+├── remote_monitor.py    # Мультисерверный мониторинг и управление нодами через SSH (NL, FIN, RU)
+├── vpn_diagnostics.py   # Глубокая диагностика VPN: проверка сокетов, инбаундов и сертификатов
+├── happ_sub_adapter.py  # Автономный адаптер подписок Happ для мгновенного импорта конфигураций
 ├── deploy.ps1           # PowerShell скрипт деплоя с автоматической валидацией кода на сервере
 ├── settings.json        # Файл пользовательских настроек бота на сервере (динамически создаётся)
 ├── metrics.db           # Локальная база SQLite для хранения точек истории ресурсов
 ├── server_guard.log     # Системный журнал работы бота (с автоматической ротацией)
 └── .env                 # (Опционально) Переменные окружения и секретные токены
 ```
-
----
-
-## ⚙️ Быстрый старт и конфигурация
-
-1. Клонируйте репозиторий:
-   ```bash
-   git clone https://github.com/bum3n/server_guard_bot.git
-   cd server_guard_bot
-   ```
-
-2. Создайте виртуальное окружение и установите зависимости:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt # pyTelegramBotAPI psutil matplotlib requests qrcode[pil]
-   ```
-
-3. Настройте файл переменных окружения:
-   ```bash
-   cp .env.example .env
-   nano .env
-   ```
-   Заполните `BOT_TOKEN`, `ADMIN_CHAT_ID`, `SERVER_IP`, `DOMAIN` и `XUI_API_TOKEN`.
-
-4. Запустите бота или настройте системный сервис systemd:
-   ```bash
-   python3 main.py
-   ```
 
 ---
 
@@ -94,7 +68,7 @@ server_guard/
 - `update_client_limits()` — Редактирование лимитов трафика (ГБ) и срока действия (дни) для существующего клиента.
 - `extend_client()` — Быстрое продление срока или добавление пакета трафика.
 - `delete_client()` — Удаление клиента во всех инбаундах с каскадной очисткой.
-- `build_links()` — Генерация чистой подписки 3X-UI (`https://{domain}/{sub_path}/{sub_id}`) и ссылки веб-шлюза (`/redirect_happ/?token=...`).
+- `build_links()` — Генерация чистой подписки 3X-UI (`https://{domain}/ebg3knjtschp25px/{sub_id}`) и ссылки веб-шлюза (`/redirect_happ/?token=...`).
 - `build_happ_deeplink()` — Построение прямого deep-link протокола Happ (`happ://add/...`) для мгновенного импорта.
 - `generate_qr_bytes()` — Формирование PNG-картинки с QR-кодом подписки.
 
@@ -116,7 +90,7 @@ server_guard/
   - База 3X-UI (`x-ui.db`), сертификаты Let's Encrypt, SSH-ключи (`authorized_keys`).
   - WARP профили (`wgcf-account.toml`, `wgcf-profile.conf`).
   - Конфигурация и сайты Nginx (`nginx.conf`, `/var/www/html`).
-  - Юниты автозапуска systemd (server_guard, mem_bot, flashcard_bot, jupyter, wireproxy, anonchat).
+  - Юниты автозапуска systemd (server_guard, mem_bot, flashcard_bot, jupyter, wireproxy, anonchat, weektrack).
   - Исходные коды проектов и базы данных (bot-проекты, учебные тетрадки `/notebooks`).
 - **Функции:**
   - `make_backup_archive()` — Создание архива `.tar.gz` с исключением тяжёлых папок (`venv`, `node_modules`, `__pycache__`).

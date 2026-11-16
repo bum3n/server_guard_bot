@@ -1,6 +1,44 @@
-venv/
-.venv/
+# Окружение и секреты
+.env
+*.env
+.env.*
+!.env.example
+
+# Базы данных и метрики
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+metrics.db
+
+# Логи и отладка
+*.log
+logs/
+server_guard.log
+
+# Бэкапы и архивы
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.bak
+backups/
+.deploy_tmp/
+settings.json
+
+# Python кэш и виртуальные окружения
 __pycache__/
 *.py[cod]
-*.log
-*.db
+*$py.class
+venv/
+.venv/
+env/
+.env/
+
+# Черновики и локальные агенты
+delegator-*
+snake/
+.agents/
+.idea/
+.vscode/

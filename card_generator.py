@@ -3,7 +3,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-def generate_status_card(cpu, ram, swap, disk, subtitle=None):
+def generate_status_card(cpu, ram, swap, disk, subtitle=None, title="СТАТУС РЕСУРСОВ VPS"):
     fig, ax = plt.subplots(figsize=(7, 4.2), facecolor='#161922')
     ax.set_facecolor('#161922')
 
@@ -43,7 +43,7 @@ def generate_status_card(cpu, ram, swap, disk, subtitle=None):
         spine.set_visible(False)
 
     # Без эмодзи, чтобы не появлялись квадраты
-    plt.title("СТАТУС РЕСУРСОВ VPS", color='#8b949e', fontsize=12, pad=18, fontweight='bold', loc='left')
+    plt.title(title, color='#8b949e', fontsize=12, pad=18, fontweight='bold', loc='left')
     if subtitle:
         ax.text(0, 1.02, subtitle, transform=ax.transAxes, color='#6e7681', fontsize=9, va='bottom')
     plt.tight_layout()

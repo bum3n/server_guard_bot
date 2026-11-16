@@ -39,7 +39,7 @@ def unban_ip(ip):
 def check_ssl_expiry(cert_path=None):
     """Проверка оставшихся дней действия сертификата Let's Encrypt."""
     if not cert_path:
-        domain = getattr(config, "DOMAIN", "example.com") if config else "example.com"
+        domain = getattr(config, "DOMAIN", "bbumn.ru") if config else "bbumn.ru"
         candidate = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
         if os.path.exists(candidate):
             cert_path = candidate
@@ -70,13 +70,14 @@ def renew_ssl():
         time.sleep(1)
 
         # 2. Перевыпуск через acme.sh
-        cmd_renew = "/root/.acme.sh/acme.sh --renew -d example.com --force"
+        cert_domain = getattr(config, "SERVER_IP", "example.com")
+        cmd_renew = f"/root/.acme.sh/acme.sh --renew -d {cert_domain} --force"
         res_renew = subprocess.run(cmd_renew, shell=True, capture_output=True, text=True, timeout=90)
         output_log += res_renew.stdout + "\n" + res_renew.stderr
 
         # 3. Копирование сертификатов
         cmd_install = (
-            "/root/.acme.sh/acme.sh --install-cert -d example.com "
+            f"/root/.acme.sh/acme.sh --install-cert -d {cert_domain} "
             "--key-file /root/cert/ip/privkey.pem "
             "--fullchain-file /root/cert/ip/fullchain.pem"
         )
@@ -106,18 +107,91 @@ def renew_ssl():
 
     return msg
 
-def run_speedtest():
-    """Замер скорости канала VPS."""
+def run_speedtest(server_id="nl"):
+    """Замер скорости канала VPS (локально NL или через SSH на Финляндии / России)."""
+    fin_ip = config.SERVERS.get("fin", {}).get("ip", "201.58.188.206") if hasattr(config, "SERVERS") else "201.58.188.206"
+    ru_ip = config.SERVERS.get("ru", {}).get("ip", "62.173.152.111") if hasattr(config, "SERVERS") else "62.173.152.111"
+    remote_map = {
+        "fin": (f"root@{fin_ip}", "🇫🇮 Финляндия"),
+        "ru": (f"root@{ru_ip}", "🇷🇺 Россия"),
+    }
     try:
-        tool = "speedtest-cli" if shutil.which("speedtest-cli") else None
-        if not tool:
-            return "❌ Утилита speedtest-cli не найдена. Установите: apt install speedtest-cli"
-        
-        cmd = ["speedtest-cli", "--simple"]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        return res.stdout.strip() if res.stdout else "Не удалось получить данные замера."
+        if server_id in remote_map:
+            r_host, target_flag = remote_map[server_id]
+            remote_py = "\n".join([
+                "import subprocess, json, shutil",
+                "try:",
+                "    if shutil.which('speedtest-cli'):",
+                "        res = subprocess.run(['speedtest-cli', '--json'], capture_output=True, text=True, timeout=50)",
+                "        if res.returncode == 0 and res.stdout.strip():",
+                "            print(res.stdout); raise SystemExit(0)",
+                "    dl = subprocess.run(['curl', '-s', '-o', '/dev/null', '-w', '%{speed_download}', '-m', '15', 'https://speed.cloudflare.com/__down?bytes=25000000'], capture_output=True, text=True, timeout=18)",
+                "    ul = subprocess.run(['curl', '-s', '-o', '/dev/null', '-w', '%{speed_upload}', '-m', '15', '--data-binary', '@/bin/bash', 'https://speed.cloudflare.com/__up'], capture_output=True, text=True, timeout=18)",
+                "    ip_r = subprocess.run(['curl', '-s', '-m', '5', 'https://api.ipify.org'], capture_output=True, text=True, timeout=6)",
+                "    dl_bps = float(dl.stdout.strip() or 0) * 8",
+                "    ul_bps = float(ul.stdout.strip() or 0) * 8",
+                "    print(json.dumps({'download': dl_bps, 'upload': ul_bps, 'server': {'sponsor': 'Cloudflare CDN', 'name': 'Anycast HTTP Benchmark', 'country': 'EU/RU'}, 'client': {'ip': ip_r.stdout.strip()}}))",
+                "except Exception as e:",
+                "    print(json.dumps({'error': str(e)}))",
+            ])
+            cmd = [
+                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+                r_host, "python3", "-"
+            ]
+            ping_cmd = [
+                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
+                r_host, "ping -c 3 8.8.8.8"
+            ]
+        else:
+            target_flag = "🇳🇱 Нидерланды"
+            tool = "speedtest-cli" if shutil.which("speedtest-cli") else None
+            if not tool:
+                return "❌ Утилита speedtest-cli не найдена. Установите: apt install speedtest-cli"
+            cmd = ["speedtest-cli", "--json"]
+            ping_cmd = ["ping", "-c", "3", "8.8.8.8"]
+
+        # Получаем реальный ping до 8.8.8.8 (DNS Google)
+        real_ping_ms = "N/A"
+        try:
+            p_res = subprocess.run(ping_cmd, capture_output=True, text=True, timeout=5)
+            for line in p_res.stdout.splitlines():
+                if "min/avg/max" in line or "rtt " in line:
+                    parts = line.split("=")[-1].strip().split("/")
+                    if len(parts) >= 2:
+                        real_ping_ms = f"{float(parts[1]):.1f} ms"
+        except Exception:
+            pass
+
+        res = subprocess.run(cmd, input=(remote_py if server_id in remote_map else None), capture_output=True, text=True, timeout=65)
+        raw_out = res.stdout.strip()
+        if not raw_out:
+            return f"❌ Не удалось получить данные замера скорости. {res.stderr}"
+
+        import json
+        data = json.loads(raw_out)
+        if "error" in data:
+            return f"❌ Ошибка speedtest: {data['error']}"
+
+        dl_mbps = data.get("download", 0) / (1024 * 1024)
+        ul_mbps = data.get("upload", 0) / (1024 * 1024)
+        srv_name = data.get("server", {}).get("name", "Auto")
+        srv_country = data.get("server", {}).get("country", "")
+        srv_sponsor = data.get("server", {}).get("sponsor", "")
+        client_ip = data.get("client", {}).get("ip", "")
+
+
+        report = (
+            f"🚀 **Результаты замера скорости сети ({target_flag}):**\n\n"
+            f"• **Сервер замера:** {srv_sponsor} ({srv_name}, {srv_country})\n"
+            f"• **IP тестируемого VPS:** `{client_ip}`\n"
+            f"• **Реальная сетевая задержка (Ping):** `{real_ping_ms}`\n"
+            f"• **Скорость загрузки (Download):** `{dl_mbps:.1f} Mbit/s`\n"
+            f"• **Скорость отдачи (Upload):** `{ul_mbps:.1f} Mbit/s`"
+        )
+        return report
+
     except subprocess.TimeoutExpired:
-        return "⏱ Время ожидания теста скорости истекло (>60 сек)."
+        return "⏱ Время ожидания теста скорости истекло (>65 сек)."
     except Exception as e:
         return f"Ошибка при тесте скорости: {e}"
 
@@ -180,4 +254,3 @@ def flush_swap():
         return "⏱ **Время ожидания выгрузки SWAP истекло (>90 сек).**"
     except Exception as e:
         return f"❌ **Ошибка при выгрузке SWAP:** {e}"
-

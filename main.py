@@ -7,6 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import threading
 import subprocess
+import concurrent.futures
 import psutil
 import requests
 import telebot
@@ -16,10 +17,10 @@ import config
 import analyzer
 import card_generator
 import backup_manager
-import vpn_manager
 import metrics_store
 import security_tools
 import maintenance
+import remote_monitor
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("server_guard")
@@ -46,7 +47,11 @@ DEFAULT_SETTINGS = {
     "backup_enabled": True,
     "backup_time": "22:00",
     "filter_system_cpu": True,
-    "service_alerts_enabled": {srv["unit"]: True for srv in config.MONITORED_SERVICES},
+    "service_alerts_enabled": {
+        srv["unit"]: True
+        for sc in config.SERVERS.values()
+        for srv in sc.get("monitored_services", [])
+    },
     "ssh_alerts_enabled": False,
     "ban_alerts_enabled": False,
     "daily_report_enabled": True,
@@ -58,7 +63,7 @@ DEFAULT_SETTINGS = {
     "last_seen_version": "",
 }
 
-active_dashboard_msg = {"chat_id": None, "message_id": None, "last_content": ""}
+active_dashboard_msg = {"chat_id": None, "message_id": None, "last_content": "", "server_id": "nl"}
 dashboard_msg = {"chat_id": None, "message_id": None}
 
 STATE_TTL = 600  # сек: забытые шаги мастеров сбрасываются автоматически
@@ -87,7 +92,7 @@ class StateDict(dict):
 
 
 user_states = StateDict()
-
+user_servers = {}  # chat_id -> "nl" или "fin"
 
 def is_admin(chat_id):
     return chat_id in config.ADMIN_IDS
@@ -117,15 +122,170 @@ def save_settings(settings):
 bot_settings = load_settings()
 IGNORED_HIGH_CPU_PROCESSES = ["apt-check", "unattended-upgr", "dpkg", "apt-get", "apt"]
 
-def get_systemd_status(unit_name):
-    try:
-        res = subprocess.run(["systemctl", "is-active", unit_name], capture_output=True, text=True, timeout=2)
-        st = res.stdout.strip()
-        return "🟢 active" if st == "active" else f"🔴 {st}"
-    except Exception:
-        return "⚪ unknown"
+def get_active_server_id(chat_id):
+    if chat_id in user_servers:
+        return user_servers[chat_id]
+    servers_map = bot_settings.get("user_servers", {})
+    val = servers_map.get(str(chat_id), servers_map.get(chat_id, "nl"))
+    user_servers[chat_id] = val
+    return val
 
-def check_http(url, timeout=5.0):
+def set_active_server_id(chat_id, server_id):
+    user_servers[chat_id] = server_id
+    if "user_servers" not in bot_settings:
+        bot_settings["user_servers"] = {}
+    bot_settings["user_servers"][str(chat_id)] = server_id
+    save_settings(bot_settings)
+
+def get_active_server_conf(chat_id):
+    sid = get_active_server_id(chat_id)
+    return config.SERVERS.get(sid, config.SERVERS["nl"])
+
+def get_systemd_status(unit_name):
+    res = get_local_systemd_statuses([unit_name])
+    return res.get(unit_name, "⚪ unknown")
+
+def get_local_systemd_statuses(unit_names):
+    if not unit_names:
+        return {}
+    try:
+        res = subprocess.run(["systemctl", "is-active"] + list(unit_names), capture_output=True, text=True, timeout=2)
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        result = {}
+        for i, u in enumerate(unit_names):
+            if i < len(lines):
+                st = lines[i]
+                result[u] = "🟢 active" if st == "active" else f"🔴 {st}"
+            else:
+                result[u] = "⚪ unknown"
+        return result
+    except Exception:
+        return {u: "⚪ unknown" for u in unit_names}
+
+def check_heavy_system_tasks():
+    """Проверяет, запущены ли процессы обновления ОС или активной сборки."""
+    package_tools = {"apt", "apt-get", "dpkg", "unattended-upgr", "needrestart", "do-release-upgrade"}
+    build_tools = {"pip", "pip3", "npm", "yarn", "cargo", "docker-build"}
+    for p in psutil.process_iter(['name']):
+        try:
+            name = (p.info['name'] or '').lower()
+            if any(pt in name for pt in package_tools):
+                return f"📦 На сервере выполняется фоновое обновление или установка пакетов ({name})"
+            if any(bt in name for bt in build_tools):
+                return f"🔨 На сервере запущен процесс сборки/установки зависимостей ({name})"
+        except Exception:
+            continue
+    return None
+
+def diagnose_service_failure(sid, unit, service_name=None):
+    """
+    Анализирует причины остановки службы через свойства systemd, логи journalctl и состояние ОС.
+    Возвращает понятное текстовое описание вероятной причины сбоя.
+    """
+    heavy_task = check_heavy_system_tasks() if sid == "nl" else None
+    if heavy_task:
+        return heavy_task
+
+    props = {}
+    last_log_lines = []
+    try:
+        if sid == "nl":
+            res = subprocess.run(
+                ["systemctl", "show", unit, "-p", "Result,ExecMainStatus,ExecMainCode,ActiveState,SubState"],
+                capture_output=True, text=True, timeout=3
+            )
+            for line in res.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k.strip()] = v.strip()
+
+            log_res = subprocess.run(
+                ["journalctl", "-u", unit, "-n", "4", "--no-pager", "-o", "cat"],
+                capture_output=True, text=True, timeout=3
+            )
+            last_log_lines = [l.strip() for l in log_res.stdout.splitlines() if l.strip()]
+        else:
+            ok, out, _ = remote_monitor.run_remote_ssh(
+                f"systemctl show {unit} -p Result,ExecMainStatus,ExecMainCode,ActiveState,SubState && echo '---LOGS---' && journalctl -u {unit} -n 4 --no-pager -o cat",
+                timeout=5,
+                server_id=sid
+            )
+            if ok and out:
+                parts = out.split("---LOGS---")
+                for line in parts[0].splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        props[k.strip()] = v.strip()
+                if len(parts) > 1:
+                    last_log_lines = [l.strip() for l in parts[1].splitlines() if l.strip()]
+    except Exception as e:
+        log.warning(f"Ошибка получения диагностики для {unit}: {e}")
+
+    result = props.get("Result", "")
+    exit_status = props.get("ExecMainStatus", "0")
+    substate = props.get("SubState", "dead")
+
+    try:
+        mem = psutil.virtual_memory()
+        if mem.percent > 95 and (result in ("signal", "oom-kill") or exit_status in ("9", "137")):
+            return "💥 Критическая нехватка RAM (>95%). Процесс принудительно завершён ядром Linux (OOM Killer)"
+    except Exception:
+        pass
+
+    if result == "success" and exit_status in ("0", 0):
+        return "⏹ Служба была штатно остановлена вручную (командой `systemctl stop`, через бота или скриптом)"
+
+    if substate == "auto-restart":
+        return "🔄 Плановый перезапуск службы (systemd auto-restart)"
+
+    if result == "oom-kill":
+        return "💥 Процесс принудительно завершён ядром Linux из-за исчерпания памяти (Out-Of-Memory Killer)"
+
+    if result == "signal":
+        if exit_status in ("9", "137"):
+            return "🛑 Процесс был принудительно убит по SIGKILL (kill -9 или OOM Killer)"
+        elif exit_status in ("15", "143"):
+            return "⏹ Процесс получил сигнал планового завершения SIGTERM"
+        else:
+            return f"🛑 Процесс завершён системным сигналом (код {exit_status})"
+
+    if result == "timeout":
+        return "⏱ Превышен лимит времени ожидания ответа службы (Systemd Watchdog / Timeout)"
+
+    if result == "core-dump":
+        return "💥 Критический сбой бинарного процесса (Segmentation Fault / Core Dump)"
+
+    log_text = " ".join(last_log_lines).lower()
+    if "address already in use" in log_text:
+        return "⚠️ Порт службы уже занят другим процессом (`Address already in use`)"
+    if "permission denied" in log_text:
+        return "🔒 Ошибка доступа к системным ресурсам или файлам (`Permission denied`)"
+    if "no space left on device" in log_text:
+        return "💾 На диске сервера закончилось свободное место (`No space left on device`)"
+    if "modulenotfounderror" in log_text or "importerror" in log_text:
+        return "🐍 Ошибка в зависимостях Python (отсутствует модуль или библиотека)"
+    if "connection refused" in log_text:
+        return "🔌 Не удалось подключиться к зависимой службе (`Connection refused`)"
+    if "database is locked" in log_text:
+        return "🗄 База данных заблокирована другим процессом (`database is locked`)"
+    if "syntaxerror" in log_text:
+        return "❌ Синтаксическая ошибка в коде скрипта (`SyntaxError`)"
+
+    relevant_logs = [l for l in last_log_lines if not any(w in l.lower() for w in ["started ", "deactivated ", "consumed "])]
+    if relevant_logs:
+        last_line = relevant_logs[-1]
+        if len(last_line) > 120:
+            last_line = last_line[:117] + "..."
+        if result == "exit-code" or exit_status != "0":
+            return f"⚠️ Процесс завершился с кодом ошибки `{exit_status}`:\n  └ `{last_line}`"
+        return f"⚠️ Последняя запись службы:\n  └ `{last_line}`"
+
+    if result == "exit-code" or exit_status != "0":
+        return f"⚠️ Процесс аварийно завершился с кодом ошибки `{exit_status}`"
+
+    return f"⚠️ Служба перешла в неактивное состояние (`{substate}`)"
+
+def check_http(url, timeout=3.0):
     try:
         headers = {
             "User-Agent": "ServerGuard/2.0"
@@ -135,16 +295,36 @@ def check_http(url, timeout=5.0):
     except Exception:
         return "🔴 down"
 
+def check_http_all(http_checks, timeout=2.5):
+    """Параллельная проверка доступности HTTP сайтов через ThreadPoolExecutor."""
+    if not http_checks:
+        return []
+
+    def _check(site):
+        name = site["name"]
+        url = site["url"]
+        return name, check_http(url, timeout=timeout)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(http_checks), 8)) as executor:
+        results = list(executor.map(_check, http_checks))
+    return results
+
 PROCESS_DESCRIPTIONS = {
     "xray-linux-amd64": "Ядро прокси Xray (шифрование и передача трафика)",
     "xray": "Ядро прокси Xray (шифрование и передача трафика)",
     "x-ui": "Панель управления 3X-UI (веб-интерфейс и база)",
     "warp-svc": "Клиент Cloudflare WARP (socks5 прокси)",
+    "wireproxy": "Клиент WireProxy (SOCKS5 прокси WARP)",
     "systemd-resolved": "Системный DNS-резолвер Linux",
     "sshd": "Служба удаленного доступа SSH",
     "nginx": "Веб-сервер и reverse proxy",
     "fail2ban-server": "Защита от брутфорса и автобан IP",
     "jupyter-lab": "Среда разработки Jupyter Lab",
+    "beszel": "Центральный сервер мониторинга Beszel Hub",
+    "beszel-agent": "Агент сбора метрик Beszel Agent",
+    "vaultwarden": "Менеджер паролей Vaultwarden (Docker)",
+    "docker-proxy": "Прокси сетевых портов Docker",
+    "containerd-shim-runc-v2": "Контейнерный рантайм containerd-shim",
     "apt-check": "Проверка доступных обновлений Ubuntu",
     "unattended-upgr": "Фоновая установка обновлений безопасности",
     "systemd-journal": "Служба сбора системных журналов и логов",
@@ -153,70 +333,173 @@ PROCESS_DESCRIPTIONS = {
 
 def notify_admins(text, photo=None, reply_markup=None):
     """Отправка уведомления всем администраторам из config.ADMIN_IDS."""
+    sent_messages = []
     for admin_id in config.ADMIN_IDS:
         try:
             if photo:
                 photo.seek(0)
-                bot.send_photo(admin_id, photo=photo, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+                m = bot.send_photo(admin_id, photo=photo, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
             else:
-                bot.send_message(admin_id, text, reply_markup=reply_markup, parse_mode="Markdown")
+                m = bot.send_message(admin_id, text, reply_markup=reply_markup, parse_mode="Markdown")
+            if m:
+                sent_messages.append(m)
         except Exception as e:
             log.warning(f"Не удалось отправить админу {admin_id}: {e}")
+    return sent_messages
+
+def is_protected_proc(pid, name):
+    """Проверка, является ли процесс системно защищенным от завершения."""
+    name_l = name.lower()
+    if any(p in name_l for p in config.PROTECTED_PROCESSES):
+        return True
+    try:
+        p = psutil.Process(int(pid))
+        cmd = " ".join(p.cmdline()).lower()
+        if any(p in cmd for p in config.PROTECTED_PROCESSES):
+            return True
+        if any(b in cmd for b in ["server_guard", "antigravity", "vpn_guard", "wireproxy"]):
+            return True
+    except Exception:
+        pass
+    return False
 
 def get_process_description(proc, name):
-    if name.lower().startswith("python"):
-        try:
-            cmd = proc.cmdline()
-            cmd_str = " ".join(cmd).lower()
-            if "server_guard" in cmd_str:
-                return "Бот мониторинга Server Guard"
-            if "membot" in cmd_str or "mem_bot" in cmd_str:
-                return "Telegram-бот MemBot"
-            if "flashcard" in cmd_str:
-                return "Telegram-бот FlashCard Bot"
-            if "anonchat" in cmd_str:
-                return "Telegram-бот AnonChat Bot"
-            if "jupyter" in cmd_str:
-                return "Ядро/сервер Jupyter"
-            for arg in cmd[1:]:
-                if arg.endswith(".py"):
-                    return f"Скрипт Python: {os.path.basename(arg)}"
-            return "Фоновый процесс Python"
-        except Exception:
-            return "Интерпретатор Python"
-    
-    for key, desc in PROCESS_DESCRIPTIONS.items():
-        if key.lower() in name.lower():
-            return desc
-            
-    if name.startswith("kworker") or name.startswith("rcu_") or name.startswith("ksoftirqd"):
-        return "Системный поток ядра Linux"
-        
-    return "Системный/пользовательский процесс"
+    cmd = []
+    try:
+        cmd = proc.cmdline()
+    except Exception:
+        pass
+    cmd_str = " ".join(cmd).lower() if cmd else ""
+    name_lower = name.lower()
 
-def get_top_cpu_data(limit=5):
+    # 1. Потоки ядра Linux (PID <= 2 или без cmdline и специфичные имена)
+    if proc.pid <= 2 or not cmd:
+        kernel_prefixes = (
+            "kworker", "rcu", "ksoftirqd", "migration", "cpuhp", "idle_inject",
+            "kdevtmpfs", "kauditd", "khungtaskd", "oom_reaper", "kcompactd",
+            "ksmd", "khugepaged", "jbd2", "irq/", "scsi_", "pool_workqueue",
+            "kswapd", "watchdogd", "ecryptfs", "hwrng"
+        )
+        if any(name_lower.startswith(kp) for kp in kernel_prefixes) or name_lower in ("kthreadd",):
+            return "Системный поток ядра Linux"
+
+    # 2. Python процессы и Telegram-боты
+    if name_lower.startswith("python") or "python" in cmd_str:
+        if "server_guard" in cmd_str:
+            return "Бот мониторинга Server Guard"
+        if "antigravity" in cmd_str or "bumagent" in cmd_str:
+            return "Telegram-бот Antigravity Agent (@bumagent_bot)"
+        if "vpn_guard" in cmd_str or "bumvpn" in cmd_str:
+            return "Telegram-бот bumVPN Guard (@bumvpnguard_bot)"
+        if "happ_sub_adapter" in cmd_str or "happ" in cmd_str:
+            return "Адаптер подписок Happ (happ-sub-adapter)"
+        if "membot" in cmd_str or "mem_bot" in cmd_str:
+            return "Telegram-бот MemBot"
+        if "flashcard" in cmd_str:
+            return "Telegram-бот FlashCard Bot"
+        if "anonchat" in cmd_str:
+            return "Telegram-бот AnonChat Bot"
+        if "weektrack" in cmd_str:
+            return "Telegram-бот WeekTrack (расписание и маршруты)"
+        if "ipykernel" in cmd_str:
+            return "Интерактивное ядро Jupyter Notebook"
+        if "jupyter" in cmd_str:
+            return "Среда разработки Jupyter Lab"
+        if "speedtest" in cmd_str:
+            return "Тест скорости сети VPS (speedtest-cli)"
+        if "fail2ban" in cmd_str:
+            return "Защита от брутфорса Fail2ban"
+        if "check-new-release" in cmd_str or "do-release-upgrade" in cmd_str:
+            return "Проверка новых версий Ubuntu"
+        if "unattended-upgrades" in cmd_str or "unattended-upgr" in cmd_str:
+            return "Фоновое обновление безопасности Ubuntu"
+        for arg in cmd[1:]:
+            if arg.endswith(".py"):
+                return f"Скрипт Python: {os.path.basename(arg)}"
+            if "/" in arg:
+                base = os.path.basename(arg)
+                if base:
+                    return f"Модуль Python: {base}"
+        return "Фоновый процесс Python"
+
+    # 3. Известные демоны и службы
+    known = {
+        "xray": "Ядро прокси Xray (шифрование и передача трафика)",
+        "x-ui": "Панель управления 3X-UI (веб-интерфейс и база)",
+        "wireproxy": "Клиент WireProxy (SOCKS5 прокси WARP)",
+        "warp-svc": "Клиент Cloudflare WARP (socks5 прокси)",
+        "systemd-resolved": "Системный DNS-резолвер Linux",
+        "sshd": "Служба удаленного доступа SSH",
+        "nginx": "Веб-сервер и reverse proxy Nginx",
+        "fail2ban": "Защита от брутфорса и автобан IP",
+        "jupyter": "Среда разработки Jupyter Lab",
+        "arcade-hub": "Сервер интерактивных игр Arcade Hub (Node.js)",
+        "arcade": "Сервер интерактивных игр Arcade Hub (Node.js)",
+        "node": "Сервер интерактивных игр Arcade Hub (Node.js)" if "arcade" in cmd_str else "Среда выполнения Node.js",
+        "beszel-hub": "Центральный сервер мониторинга Beszel Hub",
+        "beszel-agent": "Агент сбора метрик Beszel Agent",
+        "beszel": "Сервер мониторинга Beszel Hub",
+        "vaultwarden": "Менеджер паролей Vaultwarden (Docker)",
+        "docker-proxy": "Прокси сетевых портов Docker (Vaultwarden)",
+        "containerd-shim": "Контейнерный рантайм containerd-shim",
+        "docker": "Контейнеризация Docker",
+        "containerd": "Среда выполнения контейнеров containerd",
+        "mtg": "MTProto Telegram Proxy",
+        "adguard": "Блокировщик рекламы и трекеров AdGuard Home",
+        "multipathd": "Служба отказоустойчивости дисков Multipath",
+        "systemd-journal": "Служба сбора системных журналов и логов",
+        "rsyslog": "Системный демон логирования",
+        "cron": "Служба планировщика задач Cron",
+        "dbus": "Системная шина сообщений D-Bus",
+        "qemu-ga": "QEMU Guest Agent (агент виртуализации)",
+        "fwupd": "Служба обновления прошивок оборудования",
+        "polkit": "Служба авторизации привилегий PolicyKit",
+        "agetty": "Терминальная консоль Linux (TTY)",
+        "udisks": "Служба управления дисковыми накопителями",
+        "modemmanager": "Служба управления модемами ModemManager",
+        "psimon": "Мониторинг давления на ресурсы (PSI)",
+        "systemd": "Системный менеджер systemd",
+    }
+    for k, desc in known.items():
+        if k in name_lower or k in cmd_str:
+            return desc
+
+    # 4. Если есть cmdline, определяем бинарник
+    if cmd:
+        exe = os.path.basename(cmd[0]).strip("-")
+        if exe and exe.lower() != name_lower:
+            return f"Процесс {exe}"
+        return f"Служба {name}"
+
+    return "Неизвестный процесс"
+
+def get_top_cpu_data(limit=6):
     procs = []
-    for p in psutil.process_iter(['pid', 'name']):
+    for p in psutil.process_iter(['pid', 'name', 'cpu_times', 'memory_info']):
         try:
             p.cpu_percent(None)
             procs.append(p)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    time.sleep(1.0)
+    time.sleep(0.4)
     results = []
     for p in procs:
         try:
             cpu = p.cpu_percent(None)
-            if cpu > 0.1:
-                name = p.info['name']
-                desc = get_process_description(p, name)
-                results.append((name, p.info['pid'], cpu, desc))
+            t = p.info.get('cpu_times')
+            total_time = (t.user + t.system) if t else 0
+            mem_info = p.info.get('memory_info')
+            rss = mem_info.rss if mem_info else 0
+            name = p.info['name']
+            desc = get_process_description(p, name)
+            results.append((name, p.info['pid'], cpu, rss, total_time, desc))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    results.sort(key=lambda x: x[2], reverse=True)
-    return results[:limit]
+    # Сортировка: сначала по текущему % CPU, при равенстве - по общему времени CPU
+    results.sort(key=lambda x: (x[2], x[4]), reverse=True)
+    return [(r[0], r[1], r[2], r[3], r[5]) for r in results[:limit]]
 
 def get_top_ram_data(limit=6):
     results = []
@@ -225,10 +508,9 @@ def get_top_ram_data(limit=6):
             mem_info = p.info['memory_info']
             rss = mem_info.rss if mem_info else 0
             mem_pct = p.info['memory_percent'] or 0.0
-            if rss > 1024 * 1024:  # > 1 MB
-                name = p.info['name']
-                desc = get_process_description(p, name)
-                results.append((name, p.info['pid'], rss, mem_pct, desc))
+            name = p.info['name']
+            desc = get_process_description(p, name)
+            results.append((name, p.info['pid'], rss, mem_pct, desc))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
@@ -254,114 +536,221 @@ def get_top_swap_data(limit=6):
                                 break
                 except Exception:
                     pass
-            if swap_bytes > 1024:  # > 1 KB
-                name = p.info['name']
-                desc = get_process_description(p, name)
-                results.append((name, p.info['pid'], swap_bytes, desc))
+            name = p.info['name']
+            desc = get_process_description(p, name)
+            results.append((name, p.info['pid'], swap_bytes, desc))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
     results.sort(key=lambda x: x[2], reverse=True)
     return results[:limit]
 
-def build_top_procs_text_and_kb(mode="cpu"):
+NUM_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+def build_top_procs_text_and_kb(mode="cpu", server_id="nl"):
     kb = types.InlineKeyboardMarkup()
-    lines = []
-    
+    srv_conf = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    srv_flag = srv_conf.get("flag", "🌐")
+    srv_name = srv_conf.get("name", server_id)
+    is_local = srv_conf.get("is_local", True)
+
     if mode == "ram":
-        lines.append("🔝 **Топ процессов по использованию ОЗУ (RAM):**\n")
-        procs = get_top_ram_data(limit=6)
-        if not procs:
-            lines.append("• Активные процессы с ОЗУ не зафиксированы.")
+        header = f"📶 Топ процессов по ОЗУ на сервере {srv_flag} {srv_name}:\n"
+        if is_local:
+            procs = get_top_ram_data(limit=6)
         else:
-            for name, pid, rss, pct, desc in procs:
+            procs = remote_monitor.get_remote_top_procs(mode="ram", limit=6, server_id=server_id)
+
+        if not procs:
+            body = "• Активные процессы с ОЗУ не зафиксированы."
+        else:
+            items = []
+            for idx, (name, pid, rss, pct, desc) in enumerate(procs):
+                num = NUM_EMOJIS[idx] if idx < len(NUM_EMOJIS) else f"{idx+1}️⃣"
+                clean_name = name.replace("*", "").replace("_", "\\_")
+                clean_desc = desc.replace("*", "").replace("_", "\\_")
                 mb = rss / (1024 * 1024)
-                lines.append(f"• `{name}` (PID {pid}): **{mb:.1f} MB** (`{pct:.1f}%`)\n  └ *{desc}*")
-                if mb > 150.0 and not any(p in name.lower() for p in config.PROTECTED_PROCESSES):
-                    kb.add(types.InlineKeyboardButton(f"☠️ Убить {name[:12]} (PID {pid})", callback_data=f"kill:{pid}:{name}"))
+                item = (
+                    f"{num} **{clean_name}**\n"
+                    f"— `{pct:.1f}%` — `{mb:.1f} MB`\n"
+                    f"— **{clean_desc}** — `PID {pid}`"
+                )
+                items.append(item)
+            body = "\n\n".join(items)
 
     elif mode == "swap":
-        lines.append("🔝 **Топ процессов по использованию SWAP (файла подкачки):**\n")
-        procs = get_top_swap_data(limit=6)
-        if not procs:
-            lines.append("• Процессы, использующие SWAP, не обнаружены (или SWAP пуст).")
+        header = f"📶 Топ процессов по SWAP на сервере {srv_flag} {srv_name}:\n"
+        if is_local:
+            procs = get_top_swap_data(limit=6)
         else:
+            procs = remote_monitor.get_remote_top_procs(mode="swap", limit=6, server_id=server_id)
+
+        if not procs or all(p[2] == 0 for p in procs):
+            body = "• Процессы, использующие SWAP, не обнаружены (SWAP свободен)."
+        else:
+            items = []
+            valid_idx = 0
             for name, pid, swap_b, desc in procs:
+                if swap_b <= 0:
+                    continue
+                num = NUM_EMOJIS[valid_idx] if valid_idx < len(NUM_EMOJIS) else f"{valid_idx+1}️⃣"
+                valid_idx += 1
+                clean_name = name.replace("*", "").replace("_", "\\_")
+                clean_desc = desc.replace("*", "").replace("_", "\\_")
                 mb = swap_b / (1024 * 1024)
                 kb_val = swap_b / 1024
                 size_str = f"{mb:.1f} MB" if mb >= 1.0 else f"{kb_val:.0f} KB"
-                lines.append(f"• `{name}` (PID {pid}): **{size_str}**\n  └ *{desc}*")
-                if mb > 50.0 and not any(p in name.lower() for p in config.PROTECTED_PROCESSES):
-                    kb.add(types.InlineKeyboardButton(f"☠️ Убить {name[:12]} (PID {pid})", callback_data=f"kill:{pid}:{name}"))
+                item = (
+                    f"{num} **{clean_name}**\n"
+                    f"— `{size_str}`\n"
+                    f"— **{clean_desc}** — `PID {pid}`"
+                )
+                items.append(item)
+            body = "\n\n".join(items) if items else "• Процессы, использующие SWAP, не обнаружены."
 
     else:  # mode == "cpu"
-        lines.append("🔝 **Топ процессов по CPU прямо сейчас:**\n")
-        procs = get_top_cpu_data(limit=6)
-        if not procs:
-            lines.append("• Процессы с явным потреблением CPU не зафиксированы.")
+        header = f"📶 Топ процессов по CPU на сервере {srv_flag} {srv_name}:\n"
+        if is_local:
+            procs = get_top_cpu_data(limit=6)
         else:
-            for name, pid, cpu, desc in procs:
-                lines.append(f"• `{name}` (PID {pid}): **{cpu:.1f}%**\n  └ *{desc}*")
-                if cpu > 15.0 and not any(p in name.lower() for p in config.PROTECTED_PROCESSES):
-                    kb.add(types.InlineKeyboardButton(f"☠️ Убить {name[:12]} (PID {pid})", callback_data=f"kill:{pid}:{name}"))
+            procs = remote_monitor.get_remote_top_procs(mode="cpu", limit=6, server_id=server_id)
 
-    btn_cpu = types.InlineKeyboardButton("💻 CPU" + (" (•)" if mode == "cpu" else ""), callback_data="procs:cpu")
-    btn_ram = types.InlineKeyboardButton("🧠 ОЗУ" + (" (•)" if mode == "ram" else ""), callback_data="procs:ram")
-    btn_swap = types.InlineKeyboardButton("💾 SWAP" + (" (•)" if mode == "swap" else ""), callback_data="procs:swap")
+        if not procs:
+            body = "• Процессы с явным потреблением CPU не зафиксированы."
+        else:
+            items = []
+            for idx, item in enumerate(procs):
+                num = NUM_EMOJIS[idx] if idx < len(NUM_EMOJIS) else f"{idx+1}️⃣"
+                name = item[0]
+                pid = item[1]
+                cpu = item[2]
+                rss = item[3] if len(item) > 4 else 0
+                desc = item[-1]
+                clean_name = name.replace("*", "").replace("_", "\\_")
+                clean_desc = desc.replace("*", "").replace("_", "\\_")
+                mb = rss / (1024 * 1024)
+                if mb > 0.1:
+                    metric_line = f"— `{cpu:.1f}%` — `{mb:.1f} MB`"
+                else:
+                    metric_line = f"— `{cpu:.1f}%`"
+                proc_item = (
+                    f"{num} **{clean_name}**\n"
+                    f"{metric_line}\n"
+                    f"— **{clean_desc}** — `PID {pid}`"
+                )
+                items.append(proc_item)
+            body = "\n\n".join(items)
+
+    btn_cpu = types.InlineKeyboardButton("💻 CPU" + (" (•)" if mode == "cpu" else ""), callback_data=f"procs:{server_id}:cpu")
+    btn_ram = types.InlineKeyboardButton("🧠 ОЗУ" + (" (•)" if mode == "ram" else ""), callback_data=f"procs:{server_id}:ram")
+    btn_swap = types.InlineKeyboardButton("💾 SWAP" + (" (•)" if mode == "swap" else ""), callback_data=f"procs:{server_id}:swap")
     kb.row(btn_cpu, btn_ram, btn_swap)
+    kb.add(types.InlineKeyboardButton("🔄 Обновить", callback_data=f"procs_refresh:{server_id}:{mode}"))
 
-    return "\n".join(lines), kb
+    full_text = f"{header}\n{body}"
+    return full_text, kb
 
-def format_system_text():
-    cpu = psutil.cpu_percent(interval=1)
-    ram = psutil.virtual_memory()
-    swap = psutil.swap_memory()
-    disk = psutil.disk_usage('/')
-    summary = analyzer.get_system_summary()
+def format_system_text(server_id="nl"):
+    srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    if srv.get("is_local", True):
+        cpu = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        disk = psutil.disk_usage('/')
+        summary = analyzer.get_system_summary()
 
-    text = (
-        f"📊 **Системные ресурсы:**\n"
-        f"• **CPU:** `{cpu}%`\n"
-        f"• **RAM:** `{ram.percent}%` ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
-        f"• **Swap:** `{swap.percent}%` ({swap.used // (1024*1024)}MB / {swap.total // (1024*1024)}MB)\n"
-        f"• **Диск:** `{disk.percent}%` (Свободно: {disk.free // (1024*1024*1024)}GB)\n\n"
-        f"{summary}\n"
-    )
-    return text, cpu, ram.percent, swap.percent, disk.percent
+        text = (
+            f"📊 **Системные ресурсы {srv['flag']} {srv['name']} (`{srv['ip']}`):**\n"
+            f"• **CPU:** `{cpu}%`\n"
+            f"• **RAM:** `{ram.percent}%` ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
+            f"• **Swap:** `{swap.percent}%` ({swap.used // (1024*1024)}MB / {swap.total // (1024*1024)}MB)\n"
+            f"• **Диск:** `{disk.percent}%` (Свободно: {disk.free // (1024*1024*1024)}GB)\n\n"
+            f"{summary}\n"
+        )
+        sub = f"Uptime: {maintenance.format_duration(maintenance.get_uptime_seconds())}"
+        return text, cpu, ram.percent, swap.percent, disk.percent, sub
+    else:
+        m = remote_monitor.get_remote_system_metrics(server_id=server_id)
+        if not m:
+            text = f"❌ Не удалось получить метрики с сервера {srv['flag']} {srv['name']} (`{srv['ip']}`). Проверьте доступность SSH."
+            return text, 0.0, 0.0, 0.0, 0.0, "Uptime: N/A"
+        cpu = m["cpu"]
+        ram_pct = m["ram_pct"]
+        swap_pct = m["swap_pct"]
+        disk_pct = m["disk_pct"]
+        sub = f"Uptime: {maintenance.format_duration(m.get('uptime', 0))}"
+        text = (
+            f"📊 **Системные ресурсы {srv['flag']} {srv['name']} (`{srv['ip']}`):**\n"
+            f"• **CPU:** `{cpu}%`\n"
+            f"• **RAM:** `{ram_pct}%` ({m['ram_used']}MB / {m['ram_total']}MB)\n"
+            f"• **Swap:** `{swap_pct}%` ({m['swap_used']}MB / {m['swap_total']}MB)\n"
+            f"• **Диск:** `{disk_pct}%` (Свободно: {m['disk_free']}GB / {m['disk_total']}GB)\n"
+        )
+        return text, cpu, ram_pct, swap_pct, disk_pct, sub
 
-def make_status_inline():
+def make_status_inline(server_id="nl"):
     kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("🧹 Выгрузить SWAP", callback_data="flush_swap"),
-        types.InlineKeyboardButton("📈 График 24ч", callback_data="show_chart_24")
-    )
+    srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    if srv.get("is_local", True):
+        kb.row(
+            types.InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_metrics:{server_id}"),
+            types.InlineKeyboardButton("🧹 Выгрузить SWAP", callback_data="flush_swap")
+        )
+        kb.add(types.InlineKeyboardButton("📈 График 24ч", callback_data="show_chart_24"))
+    else:
+        kb.row(
+            types.InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_metrics:{server_id}")
+        )
     return kb
 
-def make_reply_keyboard():
+def make_reply_keyboard(chat_id=None):
+    active_sid = get_active_server_id(chat_id)
+    active_conf = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    # Верхняя кнопка переключения текущего сервера
+    markup.row(f"🌐 Сервер: {active_conf['flag']} {active_conf['name']} ⮂")
     markup.row("📊 Метрики", "🔗 Ссылки на сервисы", "🛠 Службы и Сайты")
-    markup.row("🔝 Топ процессов", "🔑 Клиенты VPN", "🚀 Тест скорости")
+    markup.row("🔝 Топ процессов", "🚀 Тест скорости")
     markup.row("📦 Бэкап сервера", "🛡 Защита Fail2Ban")
     markup.row("⚙️ Настройки", "📋 Ошибки в логах")
     return markup
 
-def make_services_inline():
+def make_services_inline(server_id="nl"):
     kb = types.InlineKeyboardMarkup()
-    for srv in config.MONITORED_SERVICES:
-        st = get_systemd_status(srv["unit"])
-        if "🔴" in st:
-            btn_action = types.InlineKeyboardButton(f"▶️ Вкл {srv['name']}", callback_data=f"srv:start:{srv['unit']}")
+    srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    is_local = srv.get("is_local", True)
+    services = srv.get("monitored_services", config.MONITORED_SERVICES)
+
+    for s in services:
+        unit = s["unit"]
+        name = s["name"]
+        if is_local:
+            st = get_systemd_status(unit)
         else:
-            btn_action = types.InlineKeyboardButton(f"⏹ Выкл {srv['name']}", callback_data=f"srv:stop:{srv['unit']}")
-        btn_restart = types.InlineKeyboardButton(f"🔄 Рестарт", callback_data=f"srv:restart:{srv['unit']}")
+            st = remote_monitor.get_remote_systemd_status(unit, server_id=server_id)
+
+        if "🔴" in st:
+            btn_action = types.InlineKeyboardButton(f"▶️ Вкл {name}", callback_data=f"srv:{server_id}:start:{unit}")
+        else:
+            btn_action = types.InlineKeyboardButton(f"⏹ Выкл {name}", callback_data=f"srv:{server_id}:stop:{unit}")
+        btn_restart = types.InlineKeyboardButton("🔄 Рестарт", callback_data=f"srv:{server_id}:restart:{unit}")
         kb.row(btn_action, btn_restart)
-    kb.add(types.InlineKeyboardButton("🔄 Обновить SSL сертификат", callback_data="renew_ssl"))
-    kb.add(types.InlineKeyboardButton("🔄 Обновить список статусов", callback_data="refresh_services"))
+
+    if is_local:
+        kb.add(types.InlineKeyboardButton("🔄 Обновить SSL сертификат", callback_data="renew_ssl"))
+    kb.add(types.InlineKeyboardButton("🔄 Обновить список статусов", callback_data=f"refresh_services:{server_id}"))
     return kb
 
 SERVICE_LINKS = [
-    [("🌐 Главный сайт", f"https://{config.DOMAIN}/"), ("🔑 Панель 3X-UI", f"{config.XUI_URL}")],
-    [("📓 Jupyter Lab", f"https://{config.DOMAIN}/jupyter/"), ("🤖 Telegram Bot", "https://t.me/your_bot")],
+    [("🌐 Главный сайт", "https://bbumn.ru/"), ("🖼 Compare App", "https://bbumn.ru/compare/")],
+    [("🕹 Arcade Hub", "https://bbumn.ru/arcade/"), ("🔒 Vaultwarden", "https://bbumn.ru/vault/")],
+    [("📊 Beszel Monitor", "https://bbumn.ru/monitor/"), ("🛡 Smart DNS", "https://dns.bbumn.ru/")],
+    [("📓 Jupyter Lab", "https://bbumn.ru/jupyter/"), ("🔑 Панель 3X-UI", "https://bbumn.ru/3x/")],
+    [("🛡 AdGuard Home", "https://bbumn.ru/adguard/"), ("🧠 Antigravity Agent", "https://t.me/bumagent_bot")],
+    [("🤖 bumVPN Guard", "https://t.me/bumvpnguard_bot"), ("📅 WeekTrack", "https://t.me/weektrack_bot")],
+    [("🎭 AnonChat Bot", "https://t.me/anonchatbum_bot"), ("🃏 FlashCard Bot", "https://t.me/gencarttbot")],
+    [("🤖 MemBot", "https://t.me/bumnmembot")],
 ]
 
 def make_links_inline():
@@ -371,35 +760,88 @@ def make_links_inline():
     return kb
 
 DEFAULT_HTTP_CHECKS = [
-    {"name": "Главный сайт", "url": f"https://{config.DOMAIN}/"},
-    {"name": "Панель 3X-UI", "url": f"{config.XUI_URL}"}
+    {"name": "Главный сайт", "url": "https://bbumn.ru/"},
+    {"name": "Compare App", "url": "https://bbumn.ru/compare/"},
+    {"name": "Arcade Hub", "url": "https://bbumn.ru/arcade/"},
+    {"name": "Vaultwarden", "url": "https://bbumn.ru/vault/"},
+    {"name": "Beszel Monitor", "url": "https://bbumn.ru/monitor/"},
+    {"name": "Smart DNS", "url": "https://dns.bbumn.ru/"},
+    {"name": "AdGuard Home UI", "url": "https://bbumn.ru/adguard/"},
+    {"name": "Jupyter Lab", "url": "https://bbumn.ru/jupyter/"}
 ]
 
-def build_services_text():
-    lines = ["🛠 **Статус служб Linux:**"]
-    for srv in config.MONITORED_SERVICES:
-        lines.append(f"• {srv['name']}: {get_systemd_status(srv['unit'])}")
+def build_services_text(server_id="nl"):
+    srv_conf = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    flag = srv_conf.get("flag", "🌐")
+    name = srv_conf.get("name", server_id)
+    is_local = srv_conf.get("is_local", True)
+    services = srv_conf.get("monitored_services", config.MONITORED_SERVICES)
+    http_checks = srv_conf.get("http_checks", [])
 
-    lines.append("\n🌐 **Доступность сайтов (HTTP):**")
-    http_checks = getattr(config, "HTTP_CHECKS", DEFAULT_HTTP_CHECKS)
-    cleaned_checks = []
-    for site in http_checks:
-        u = site.get("url", "")
-        if not u or "127.0.0.1" in u:
-            cleaned_checks = DEFAULT_HTTP_CHECKS
-            break
-        cleaned_checks.append(site)
-    if not cleaned_checks:
-        cleaned_checks = DEFAULT_HTTP_CHECKS
+    lines = [f"🛠 **Статус служб Linux ({flag} {name}):**"]
+    unit_names = [srv["unit"] for srv in services]
+    if is_local:
+        statuses = get_local_systemd_statuses(unit_names)
+    else:
+        statuses = remote_monitor.get_remote_systemd_statuses(unit_names, server_id=server_id)
 
-    for site in cleaned_checks:
-        lines.append(f"• {site['name']}: {check_http(site['url'])}")
+    for srv in services:
+        st = statuses.get(srv["unit"], "⚪ unknown")
+        lines.append(f"• {srv['name']}: {st}")
 
-    days, exp_date = analyzer.check_ssl_expiry()
-    if days is not None:
-        icon = "🟢" if days > 10 else "🟡" if days > 3 else "🔴"
-        lines.append(f"\n🔒 **SSL-сертификат панели/подписок:** {icon} `{days}` дн. (до {exp_date})")
+    tcp_checks = srv_conf.get("tcp_checks", [])
+    if tcp_checks:
+        lines.append(f"\n🔌 **Проброшенные порты ({srv_conf['ip']}):**")
+        for p_name, p_st in remote_monitor.check_remote_tcp_ports(tcp_checks, srv_conf["ip"]):
+            lines.append(f"• {p_name}: {p_st}")
+
+    if http_checks:
+        lines.append(f"\n🌐 **Доступность сервисов и сайтов (HTTP):**")
+        http_results = check_http_all(http_checks, timeout=2.5)
+        for s_name, s_status in http_results:
+            lines.append(f"• {s_name}: {s_status}")
+
+    if is_local:
+        days, exp_date = analyzer.check_ssl_expiry()
+        if days is not None:
+            icon = "🟢" if days > 10 else "🟡" if days > 3 else "🔴"
+            lines.append(f"\n🔒 **SSL-сертификат панели/подписок:** {icon} `{days}` дн. (до {exp_date})")
     return "\n".join(lines)
+
+def build_backup_message_and_kb():
+    info = backup_manager.get_last_backup_info()
+    status_text = "Включен" if bot_settings.get("backup_enabled", True) else "Выключен"
+    backup_time = bot_settings.get("backup_time", "22:00")
+
+    nl_size = info["nl_size_str"]
+    nl_date = f" (от `{info['nl_date_str']}`)" if info.get("nl_date_str") else ""
+    fin_size = info["fin_size_str"]
+    fin_date = f" (от `{info['fin_date_str']}`)" if info.get("fin_date_str") else ""
+    ru_size = info.get("ru_size_str", "~1.4 MB")
+    ru_date = f" (от `{info['ru_date_str']}`)" if info.get("ru_date_str") else ""
+
+    msg = (
+        f"📦 **Управление резервными копиями:**\n\n"
+        f"• **Ежедневный автобэкап:** `{status_text}`\n"
+        f"• **Время отправки:** `{backup_time}` (МСК)\n\n"
+        f"📊 **Размер предыдущих копий:**\n"
+        f"• 🇳🇱 Нидерланды: `{nl_size}`{nl_date}\n"
+        f"• 🇫🇮 Финляндия: `{fin_size}`{fin_date}\n"
+        f"• 🇷🇺 Россия: `{ru_size}`{ru_date}\n\n"
+        f"• **Состав:** Базы 3X-UI, Vaultwarden, боты, Smart DNS, Realm Relay (`ru`), UFW/Fail2Ban, SSL, сервисы.\n\n"
+        f"Выберите сервер для создания резервной копии:"
+    )
+
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton(f"🇳🇱 NL ({nl_size})", callback_data="backup:nl"),
+        types.InlineKeyboardButton(f"🇫🇮 FIN ({fin_size})", callback_data="backup:fin"),
+        types.InlineKeyboardButton(f"🇷🇺 RU ({ru_size})", callback_data="backup:ru")
+    )
+    kb.row(
+        types.InlineKeyboardButton("📦 Все 3 сервера (NL + FIN + RU)", callback_data="backup:all")
+    )
+    return msg, kb
 
 def make_settings_main_inline():
     kb = types.InlineKeyboardMarkup()
@@ -430,72 +872,20 @@ def make_service_alerts_inline():
     kb.row(types.InlineKeyboardButton("❮ Назад в Настройки", callback_data="cfg:back_main"))
     return kb
 
-# --- VPN UI функции ---
-
-def make_vpn_main_inline():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("➕ Добавить клиента", callback_data="vpn:new"),
-        types.InlineKeyboardButton("📋 Список клиентов", callback_data="vpn:list")
-    )
-    return kb
-
-def make_clients_list_inline(clients):
-    kb = types.InlineKeyboardMarkup()
-    for c in clients:
-        kb.add(types.InlineKeyboardButton(f"👤 {c['email']} ({vpn_manager.format_bytes(c['up'] + c['down'])})", callback_data=f"vpn_view:{c['email']}"))
-    kb.add(types.InlineKeyboardButton("➕ Добавить нового", callback_data="vpn:new"))
-    return kb
-
-def format_client_card(c):
-    used_traffic = vpn_manager.format_bytes(c["up"] + c["down"])
-    limit_traffic = f"{c['total_gb'] / (1024**3):.1f} GB" if c.get("total_gb", 0) > 0 else "Безлимит ♾"
-    
-    exp_str = "Безлимит ♾"
-    if c.get("expiry_time", 0) > 0:
-        dt = datetime.datetime.fromtimestamp(c["expiry_time"] / 1000)
-        exp_str = dt.strftime("%d.%m.%Y %H:%M")
-
-    raw_sub, happ_sub = vpn_manager.build_links(c.get("sub_id", ""))
-    st_icon = "🟢 Включен" if c.get("enable", True) else "🔴 Отключен"
-
-    text = (
-        f"👤 **Клиент:** `{c['email']}` ({st_icon})\n\n"
-        f"📊 **Трафик:** `{used_traffic}` / `{limit_traffic}`\n"
-        f"⏳ **Срок действия:** `{exp_str}`\n"
-        f"🌐 **Серверов привязано:** `{len(c.get('inbound_ids', []))}` (Нидерланды Reality/Hysteria)\n"
-        f"⚡ **Flow:** `xtls-rprx-vision`\n\n"
-        f"🔗 **Ссылка быстрого перехода в Happ:**\n`{happ_sub}`\n\n"
-        f"🔒 **Прямая ссылка 3X-UI:**\n`{raw_sub}`"
-    )
-    return text, raw_sub, happ_sub
-
-def make_client_view_keyboard(email, happ_url, is_enabled=True):
-    """Клавиатура управления клиентом (сразу содержит 'Изменить' и 'Удалить')."""
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("🚀 В Happ", url=happ_url),
-        types.InlineKeyboardButton("⚙️ Изменить", callback_data=f"vpn_edit:{email}")
-    )
-    toggle_txt = "🔴 Отключить" if is_enabled else "🟢 Включить"
-    kb.row(
-        types.InlineKeyboardButton(toggle_txt, callback_data=f"vpn_toggle:{email}"),
-        types.InlineKeyboardButton("🗑 Удалить", callback_data=f"vpn_del_confirm:{email}")
-    )
-    kb.add(types.InlineKeyboardButton("❮ К списку клиентов", callback_data="vpn:list"))
-    return kb
-
 # --- Команды бота ---
 
 @bot.message_handler(commands=['start', 'menu'])
 def handle_start(message):
     if not is_admin(message.chat.id):
         return
+    active_sid = get_active_server_id(message.chat.id)
+    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
     bot.send_message(
         message.chat.id,
         "🛡 **Центр управления VPS Server Guard активен.**\n"
+        f"Текущий сервер: **{srv['flag']} {srv['name']}** (`{srv['ip']}`)\n"
         f"Версия бота: `v{config.BOT_VERSION}`",
-        reply_markup=make_reply_keyboard(),
+        reply_markup=make_reply_keyboard(message.chat.id),
         parse_mode="Markdown"
     )
 
@@ -503,35 +893,41 @@ def handle_start(message):
 def handle_status_cmd(message):
     if not is_admin(message.chat.id):
         return
-    msg_text, cpu, ram, swap, disk = format_system_text()
-    sub = f"Uptime: {maintenance.format_duration(maintenance.get_uptime_seconds())}"
-    photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub)
-    bot.send_photo(message.chat.id, photo_buf, caption=msg_text, reply_markup=make_status_inline(), parse_mode="Markdown")
+    active_sid = get_active_server_id(message.chat.id)
+    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    msg_text, cpu, ram, swap, disk, sub = format_system_text(active_sid)
+    photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub, title=f"СТАТУС РЕСУРСОВ VPS ({srv['name'].upper()})")
+    bot.send_photo(message.chat.id, photo_buf, caption=msg_text, reply_markup=make_status_inline(active_sid), parse_mode="Markdown")
 
 @bot.message_handler(commands=['backup'])
 def handle_backup_cmd(message):
     if not is_admin(message.chat.id):
         return
-    bot.send_message(message.chat.id, "⏳ Создаю архив ключевых данных сервера...")
-    success, res = backup_manager.send_backup(bot, message.chat.id)
-    if not success:
-        bot.send_message(message.chat.id, f"❌ Ошибка создания бэкапа: {res}")
+    msg, kb = build_backup_message_and_kb()
+    bot.send_message(message.chat.id, msg, reply_markup=kb, parse_mode="Markdown")
 
 @bot.message_handler(commands=['speedtest'])
 def handle_speedtest_cmd(message):
     if not is_admin(message.chat.id):
         return
-    bot.send_message(message.chat.id, "⏳ Запускаю замер скорости канала VPS (30-40 сек)...")
+    active_sid = get_active_server_id(message.chat.id)
+    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    bot.send_message(message.chat.id, f"⏳ Запускаю замер скорости канала VPS ({srv['flag']} {srv['name']}, 30-40 сек)...")
     bot.send_chat_action(message.chat.id, 'typing')
-    res = analyzer.run_speedtest()
-    bot.send_message(message.chat.id, f"🚀 **Результаты Speedtest:**\n```text\n{res}\n```", parse_mode="Markdown")
+    res = analyzer.run_speedtest(server_id=active_sid)
+    bot.send_message(message.chat.id, res, parse_mode="Markdown")
 
 @bot.message_handler(commands=['logs'])
 def handle_logs_cmd(message):
     if not is_admin(message.chat.id):
         return
-    logs = analyzer.get_critical_logs(lines=15)
-    bot.send_message(message.chat.id, f"📋 **Реальные системные ошибки (24ч):**\n```text\n{logs[-3500:]}\n```", parse_mode="Markdown")
+    active_sid = get_active_server_id(message.chat.id)
+    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    if srv.get("is_local", True):
+        logs = analyzer.get_critical_logs(lines=15)
+    else:
+        logs = remote_monitor.get_remote_critical_logs(lines=15, server_id=active_sid)
+    bot.send_message(message.chat.id, f"📋 **Реальные системные ошибки ({srv['flag']} {srv['name']}, 24ч):**\n```text\n{logs[-3500:]}\n```", parse_mode="Markdown")
 
 @bot.message_handler(commands=['unban'])
 def handle_unban_cmd(message):
@@ -555,7 +951,6 @@ def handle_help_cmd(message):
         "🔗 **Ссылки на сервисы** — список прямого перехода к веб-приложениям.\n"
         "🛠 **Службы и Сайты** — статус systemd и HTTP, кнопки включения/выключения.\n"
         "🔝 **Топ процессов** — процессы с высоким потреблением CPU.\n"
-        "🔑 **Клиенты VPN** — полная карточка клиента 3X-UI, изменение лимитов, выключение, QR-код.\n"
         "🚀 **Тест скорости** — замер скорости сети VPS через Speedtest.\n"
         "📦 **Бэкап сервера** — архивация и отправка резервной копии.\n"
         "🛡 **Защита Fail2Ban** — заблокированные IP за атаки на SSH и разбан.\n"
@@ -588,7 +983,7 @@ def handle_text(message):
     text = message.text or ""
 
     menu_buttons = [
-        "Метрики", "Ссылки на сервисы", "Службы и Сайты", "Топ процессов", "Клиенты VPN",
+        "Метрики", "Ссылки на сервисы", "Службы и Сайты", "Топ процессов",
         "Бэкап сервера", "Настройки", "Тест скорости", "Защита Fail2Ban", "Ошибки в логах"
     ]
     if any(btn in text for btn in menu_buttons):
@@ -618,186 +1013,52 @@ def handle_text(message):
             bot.send_message(message.chat.id, "❌ Введите время в формате `ЧЧ:ММ` (например, `22:00` или `23`):")
             return
 
-    # 2. Мастер VPN: ввод Email
-    if state == "vpn_waiting_email":
-        email = text.strip()
-        user_states[message.chat.id] = {"step": "vpn_confirm", "email": email, "sub_id": ""}
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("🎲 Случайный ID подписки", callback_data="vpn_sub:random"),
-            types.InlineKeyboardButton("✏️ Ввести свой ID", callback_data="vpn_sub:custom")
+    # --- Переключение активного сервера (nl -> fin -> ru -> nl) ---
+    if "Сервер:" in text or "⮂" in text:
+        cur_sid = get_active_server_id(message.chat.id)
+        order = [sid for sid in ("nl", "fin", "ru") if sid in config.SERVERS]
+        idx = order.index(cur_sid) if cur_sid in order else 0
+        next_sid = order[(idx + 1) % len(order)]
+        set_active_server_id(message.chat.id, next_sid)
+        srv = config.SERVERS[next_sid]
+        bot.send_message(
+            message.chat.id,
+            f"🔄 **Активный сервер переключен:** {srv['flag']} **{srv['name']}** (`{srv['ip']}`)\n"
+            f"Все вкладки «Метрики», «Службы», «Топ процессов» теперь отображают данные этого сервера.",
+            reply_markup=make_reply_keyboard(message.chat.id),
+            parse_mode="Markdown"
         )
-        bot.send_message(message.chat.id, f"👤 Имя клиента: `{email}`\n\nВыберите способ создания ID подписки:", reply_markup=kb, parse_mode="Markdown")
-        return
-
-    # 3. Мастер VPN: ввод кастомного subId
-    if isinstance(state, dict) and state.get("step") == "vpn_waiting_sub_id":
-        state["sub_id"] = text.strip()
-        state["step"] = "vpn_limits"
-        user_states[message.chat.id] = state
-        
-        kb = types.InlineKeyboardMarkup()
-        kb.row(types.InlineKeyboardButton("♾ Безлимит (по умолчанию)", callback_data="vpn_lim:unlim"))
-        kb.row(types.InlineKeyboardButton("✏️ Указать ГБ и дни вручную", callback_data="vpn_lim:manual"))
-        bot.send_message(message.chat.id, "Выберите лимиты для клиента:", reply_markup=kb, parse_mode="Markdown")
-        return
-
-    # 4. Мастер VPN: ручной ввод ГБ
-    if isinstance(state, dict) and state.get("step") == "vpn_waiting_gb":
-        try:
-            gb = float(text.replace(",", ".").strip())
-            state["total_gb"] = gb
-            state["step"] = "vpn_waiting_days"
-            user_states[message.chat.id] = state
-            bot.send_message(message.chat.id, f"Лимит трафика: `{gb}` GB.\n\nТеперь отправьте срок действия в днях (например `30` или `0` для бессрочного):")
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Введите число (например, `50` или `100.5`):")
-        return
-
-    # 5. Мастер VPN: ручной ввод дней
-    if isinstance(state, dict) and state.get("step") == "vpn_waiting_days":
-        try:
-            days = int(text.strip())
-            state["days_limit"] = days
-            email = state["email"]
-            sub_id = state.get("sub_id")
-            total_gb = state.get("total_gb", 0)
-
-            user_states.pop(message.chat.id, None)
-            bot.send_message(message.chat.id, "⏳ Создаю клиента через официальный API 3X-UI...")
-
-            ok, res = vpn_manager.create_client(
-                email=email,
-                sub_id=sub_id,
-                total_gb=total_gb,
-                days_limit=days
-            )
-
-            if not ok:
-                bot.send_message(message.chat.id, f"❌ Ошибка создания клиента: `{res}`", parse_mode="Markdown")
-                return
-
-            client_data = vpn_manager.get_client_by_email(email)
-            if not client_data:
-                client_data = {
-                    "email": email,
-                    "sub_id": res,
-                    "total_gb": int(total_gb * (1024**3)),
-                    "expiry_time": int((time.time() + days*86400)*1000) if days > 0 else 0,
-                    "inbound_ids": [1, 2, 3, 5],
-                    "up": 0, "down": 0
-                }
-
-            card_text, raw_sub, happ_url = format_client_card(client_data)
-            qr_buf = vpn_manager.generate_qr_bytes(raw_sub)
-            kb = make_client_view_keyboard(email, happ_url, client_data.get("enable", True))
-
-            bot.send_photo(
-                message.chat.id,
-                photo=qr_buf,
-                caption=f"✅ **Клиент успешно создан во всех 4 серверах!**\n\n{card_text}",
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Введите целое число дней (например, `30`):")
-        return
-
-    # 6. Редактирование лимита ГБ
-    if isinstance(state, dict) and state.get("step") == "vpn_edit_gb":
-        target_em = state["target_email"]
-        try:
-            gb = float(text.replace(",", ".").strip())
-            vpn_manager.update_client_limits(target_em, total_gb=gb)
-            user_states.pop(message.chat.id, None)
-            try:
-                bot.delete_message(message.chat.id, message.message_id)
-            except Exception:
-                pass
-            client_data = vpn_manager.get_client_by_email(target_em)
-            if client_data:
-                card_text, raw_sub, happ_url = format_client_card(client_data)
-                kb = make_client_view_keyboard(target_em, happ_url, client_data.get("enable", True))
-                qr_buf = vpn_manager.generate_qr_bytes(raw_sub)
-                bot.send_photo(message.chat.id, photo=qr_buf, caption=f"✅ **Лимит трафика обновлен (`{gb}` GB)!**\n\n{card_text}", reply_markup=kb, parse_mode="Markdown")
-            else:
-                bot.send_message(message.chat.id, f"✅ Лимит трафика для `{target_em}` установлен на `{gb}` GB.")
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Введите число:")
-        return
-
-    # 7. Редактирование срока дней
-    if isinstance(state, dict) and state.get("step") == "vpn_edit_days":
-        target_em = state["target_email"]
-        try:
-            days = int(text.strip())
-            vpn_manager.update_client_limits(target_em, days_limit=days)
-            user_states.pop(message.chat.id, None)
-            try:
-                bot.delete_message(message.chat.id, message.message_id)
-            except Exception:
-                pass
-            client_data = vpn_manager.get_client_by_email(target_em)
-            if client_data:
-                card_text, raw_sub, happ_url = format_client_card(client_data)
-                kb = make_client_view_keyboard(target_em, happ_url, client_data.get("enable", True))
-                qr_buf = vpn_manager.generate_qr_bytes(raw_sub)
-                bot.send_photo(message.chat.id, photo=qr_buf, caption=f"✅ **Срок действия обновлен (`{days}` дн.)!**\n\n{card_text}", reply_markup=kb, parse_mode="Markdown")
-            else:
-                bot.send_message(message.chat.id, f"✅ Срок действия для `{target_em}` обновлен на `{days}` дн.")
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Введите целое число дней:")
         return
 
     # --- Кнопки главного меню ---
 
+    active_sid = get_active_server_id(message.chat.id)
+
     if "Метрики" in text:
-        msg_text, cpu, ram, swap, disk = format_system_text()
-        sub = f"Uptime: {maintenance.format_duration(maintenance.get_uptime_seconds())}"
-        photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub)
-        bot.send_photo(message.chat.id, photo_buf, caption=msg_text, reply_markup=make_status_inline(), parse_mode="Markdown")
+        msg_text, cpu, ram, swap, disk, sub = format_system_text(active_sid)
+        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub, title=f"СТАТУС РЕСУРСОВ VPS ({srv['name'].upper()})")
+        bot.send_photo(message.chat.id, photo_buf, caption=msg_text, reply_markup=make_status_inline(active_sid), parse_mode="Markdown")
 
     elif "Ссылки на сервисы" in text:
         bot.send_message(message.chat.id, "Быстрый переход к сервисам VPS:", reply_markup=make_links_inline())
 
     elif "Службы и Сайты" in text:
-        body = build_services_text()
-        kb = make_services_inline()
+        body = build_services_text(active_sid)
+        kb = make_services_inline(active_sid)
         sent = bot.send_message(message.chat.id, body, reply_markup=kb, parse_mode="Markdown")
         active_dashboard_msg["chat_id"] = sent.chat.id
         active_dashboard_msg["message_id"] = sent.message_id
         active_dashboard_msg["last_content"] = body
+        active_dashboard_msg["server_id"] = active_sid
 
     elif "Топ процессов" in text:
         bot.send_chat_action(message.chat.id, 'typing')
-        text_msg, kb = build_top_procs_text_and_kb(mode="cpu")
+        text_msg, kb = build_top_procs_text_and_kb(mode="cpu", server_id=active_sid)
         bot.send_message(message.chat.id, text_msg, reply_markup=kb, parse_mode="Markdown")
 
-    elif "Клиенты VPN" in text or "VPN" in text:
-        try:
-            clients = vpn_manager.get_clients_list()
-            msg = (
-                f"🔑 **Управление клиентами VPN (3X-UI OpenAPI):**\n\n"
-                f"• Активных клиентов в базе: `{len(clients)}`\n"
-                f"• Целевые узлы: **Нидерланды (4 сервера: 1, 2, 3, 5)**\n"
-                f"• Интеграция: **Прямой авто-импорт в Happ**\n\n"
-                f"Выберите действие:"
-            )
-            bot.send_message(message.chat.id, msg, reply_markup=make_vpn_main_inline(), parse_mode="Markdown")
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Ошибка доступа к API: `{e}`", parse_mode="Markdown")
-
     elif "Бэкап сервера" in text:
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("⚡ Сделать бэкап прямо сейчас", callback_data="run_manual_backup"))
-        status_text = "Включен" if bot_settings.get("backup_enabled", True) else "Выключен"
-        msg = (
-            f"📦 **Управление резервными копиями:**\n\n"
-            f"• **Ежедневный автобэкап:** `{status_text}`\n"
-            f"• **Время отправки:** `{bot_settings.get('backup_time', '22:00')}` (МСК)\n"
-            f"• **Состав:** Базы 3X-UI и ботов, тетрадки, WARP, Nginx, сертификаты, сайт.\n\n"
-            f"Архив весит ~1.5 MB и отправляется прямо в этот диалог."
-        )
+        msg, kb = build_backup_message_and_kb()
         bot.send_message(message.chat.id, msg, reply_markup=kb, parse_mode="Markdown")
 
     elif "Настройки" in text:
@@ -811,15 +1072,22 @@ def handle_text(message):
         bot.send_message(message.chat.id, msg, reply_markup=make_settings_main_inline(), parse_mode="Markdown")
 
     elif "Тест скорости" in text:
-        bot.send_message(message.chat.id, "⏳ Запускаю замер скорости канала VPS (30-40 сек)...")
+        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        srv_name = f"{srv['flag']} {srv['name']}"
+        bot.send_message(message.chat.id, f"⏳ Запускаю замер скорости канала VPS ({srv_name}, 30-45 сек)...")
         bot.send_chat_action(message.chat.id, 'typing')
-        res = analyzer.run_speedtest()
-        bot.send_message(message.chat.id, f"🚀 **Результаты Speedtest:**\n```text\n{res}\n```", parse_mode="Markdown")
+        res = analyzer.run_speedtest(server_id=active_sid)
+        bot.send_message(message.chat.id, res, parse_mode="Markdown")
 
     elif "Защита Fail2Ban" in text:
-        banned, total, banned_ips = analyzer.get_fail2ban_stats()
+        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        if not srv.get("is_local", True):
+            banned, total, banned_ips = remote_monitor.get_remote_fail2ban_stats(server_id=active_sid)
+        else:
+            banned, total, banned_ips = analyzer.get_fail2ban_stats()
+
         msg = (
-            f"🛡 **Состояние Fail2Ban (защита SSH):**\n"
+            f"🛡 **Состояние Fail2Ban (защита SSH) — {srv['flag']} {srv['name']}:**\n"
             f"• Активно в бане: `{banned}`\n"
             f"• Всего поймано атак с запуска: `{total}`\n\n"
         )
@@ -828,15 +1096,19 @@ def handle_text(message):
             msg += "⛔ **Заблокированные IP прямо сейчас:**\n"
             for ip in banned_ips[:10]:
                 msg += f"• `{ip}`\n"
-                kb.add(types.InlineKeyboardButton(f"🔓 Разбанить {ip}", callback_data=f"unban:{ip}"))
+                kb.add(types.InlineKeyboardButton(f"🔓 Разбанить {ip}", callback_data=f"unban:{active_sid}:{ip}"))
         else:
             msg += "Активных банов в данный момент нет."
 
         bot.send_message(message.chat.id, msg, reply_markup=kb if banned_ips else None, parse_mode="Markdown")
 
     elif "Ошибки в логах" in text:
-        logs = analyzer.get_critical_logs(lines=15)
-        bot.send_message(message.chat.id, f"📋 **Реальные системные ошибки:**\n```text\n{logs[-3500:]}\n```", parse_mode="Markdown")
+        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        if not srv.get("is_local", True):
+            logs = remote_monitor.get_remote_critical_logs(lines=15, server_id=active_sid)
+        else:
+            logs = analyzer.get_critical_logs(lines=15)
+        bot.send_message(message.chat.id, f"📋 **Реальные системные ошибки ({srv['flag']} {srv['name']}):**\n```text\n{logs[-3500:]}\n```", parse_mode="Markdown")
 
 # --- Коллбэки ---
 
@@ -849,42 +1121,62 @@ def handle_all_callbacks(call):
 
     # Службы
     if data.startswith("srv:"):
-        _, action, unit = data.split(":", 2)
-        bot.answer_callback_query(call.id, f"Выполняю {action} для {unit}...")
-        subprocess.run(["systemctl", action, unit])
-        
-        if action in ["start", "restart"]:
-            for _ in range(4):
-                time.sleep(1)
-                body = build_services_text()
-                if "🔴 down" not in body or action == "stop":
-                    break
+        parts = data.split(":")
+        if len(parts) == 4:
+            _, server_id, action, unit = parts
         else:
-            time.sleep(1)
-            body = build_services_text()
+            _, action, unit = parts
+            server_id = "nl"
 
+        srv_conf = config.SERVERS.get(server_id, config.SERVERS["nl"])
+        bot.answer_callback_query(call.id, f"Выполняю {action} для {unit} ({srv_conf['name']})...")
+
+        if srv_conf.get("is_local", True):
+            subprocess.run(["systemctl", action, unit])
+            if action in ["start", "restart"]:
+                for _ in range(3):
+                    time.sleep(1)
+                    body = build_services_text(server_id)
+                    if "🔴 down" not in body or action == "stop":
+                        break
+            else:
+                time.sleep(1)
+                body = build_services_text(server_id)
+        else:
+            remote_monitor.control_remote_systemd(action, unit, server_id=server_id)
+            time.sleep(1.5)
+            body = build_services_text(server_id)
+
+        active_dashboard_msg["chat_id"] = call.message.chat.id
+        active_dashboard_msg["message_id"] = call.message.message_id
         active_dashboard_msg["last_content"] = body
+        active_dashboard_msg["server_id"] = server_id
         try:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 text=body,
-                reply_markup=make_services_inline(),
+                reply_markup=make_services_inline(server_id),
                 parse_mode="Markdown"
             )
         except Exception:
             pass
 
-    elif data == "refresh_services":
+    elif data.startswith("refresh_services"):
+        parts = data.split(":")
+        server_id = parts[1] if len(parts) > 1 else "nl"
         bot.answer_callback_query(call.id, "Обновляю статусы...")
-        body = build_services_text()
+        body = build_services_text(server_id)
+        active_dashboard_msg["chat_id"] = call.message.chat.id
+        active_dashboard_msg["message_id"] = call.message.message_id
         active_dashboard_msg["last_content"] = body
+        active_dashboard_msg["server_id"] = server_id
         try:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 text=body,
-                reply_markup=make_services_inline(),
+                reply_markup=make_services_inline(server_id),
                 parse_mode="Markdown"
             )
         except Exception:
@@ -892,10 +1184,38 @@ def handle_all_callbacks(call):
 
     # Выбор режима Топ процессов
     elif data.startswith("procs:"):
-        mode = data.split(":", 1)[1]
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, server_id, mode = parts
+        else:
+            _, mode = parts
+            server_id = "nl"
+
         mode_title = "CPU" if mode == "cpu" else "ОЗУ (RAM)" if mode == "ram" else "SWAP"
         bot.answer_callback_query(call.id, f"Сортировка: {mode_title}")
-        text_msg, kb = build_top_procs_text_and_kb(mode=mode)
+        text_msg, kb = build_top_procs_text_and_kb(mode=mode, server_id=server_id)
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=text_msg,
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    # Обновление Топ процессов
+    elif data.startswith("procs_refresh:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, server_id, mode = parts
+        else:
+            _, mode = parts
+            server_id = "nl"
+
+        bot.answer_callback_query(call.id, "Обновляю процессы...")
+        text_msg, kb = build_top_procs_text_and_kb(mode=mode, server_id=server_id)
         try:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
@@ -910,8 +1230,8 @@ def handle_all_callbacks(call):
     # Убийство процессов
     elif data.startswith("kill:"):
         _, pid, name = data.split(":", 2)
-        if any(p in name.lower() for p in config.PROTECTED_PROCESSES):
-            bot.answer_callback_query(call.id, f"❌ Процесс {name} защищен от завершения из бота!", show_alert=True)
+        if is_protected_proc(pid, name):
+            bot.answer_callback_query(call.id, f"❌ Процесс {name} (PID {pid}) защищен от завершения из бота!", show_alert=True)
             return
         try:
             p = psutil.Process(int(pid))
@@ -925,10 +1245,20 @@ def handle_all_callbacks(call):
 
     # Разбан IP
     elif data.startswith("unban:"):
-        ip = data.split(":", 1)[1]
-        res = analyzer.unban_ip(ip)
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, server_id, ip = parts
+        else:
+            _, ip = parts
+            server_id = "nl"
+
+        if server_id != "nl":
+            res = remote_monitor.unban_remote_ip(ip, server_id=server_id)
+        else:
+            res = analyzer.unban_ip(ip)
+
         bot.answer_callback_query(call.id, "Команда отправлена")
-        bot.send_message(call.message.chat.id, f"Разбан `{ip}`:\n{res}", parse_mode="Markdown")
+        bot.send_message(call.message.chat.id, f"Разбан `{ip}` ({server_id.upper()}):\n{res}", parse_mode="Markdown")
 
     # SSL
     elif data == "renew_ssl":
@@ -936,6 +1266,25 @@ def handle_all_callbacks(call):
         status_msg = bot.send_message(call.message.chat.id, "⏳ Обновляю сертификат Let's Encrypt...")
         res = analyzer.renew_ssl()
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=status_msg.message_id, text=res, parse_mode="Markdown")
+
+    # Обновление метрик в существующем сообщении с карточкой
+    elif data.startswith("refresh_metrics"):
+        parts = data.split(":")
+        server_id = parts[1] if len(parts) > 1 else "nl"
+        bot.answer_callback_query(call.id, "Обновляю метрики...")
+        try:
+            srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+            msg_text, cpu, ram, swap, disk, sub = format_system_text(server_id)
+            photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub, title=f"СТАТУС РЕСУРСОВ VPS ({srv['name'].upper()})")
+            media = types.InputMediaPhoto(photo_buf, caption=msg_text, parse_mode="Markdown")
+            bot.edit_message_media(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                media=media,
+                reply_markup=make_status_inline(server_id)
+            )
+        except Exception as e:
+            log.warning(f"Ошибка при обновлении метрик: {e}")
 
     # Выгрузка SWAP
     elif data == "flush_swap":
@@ -958,10 +1307,24 @@ def handle_all_callbacks(call):
         bot.send_photo(call.message.chat.id, photo=chart_buf, caption="📈 **График нагрузки и сетевого трафика VPS за 24 часа**", parse_mode="Markdown")
 
     # Ручной бэкап
-    elif data == "run_manual_backup":
-        bot.answer_callback_query(call.id, "Архивирую файлы...")
-        bot.send_message(call.message.chat.id, "⏳ Создаю и отправляю резервную копию...")
-        success, msg = backup_manager.send_backup(bot, call.message.chat.id)
+    elif data.startswith("backup:") or data == "run_manual_backup":
+        if data == "backup:nl":
+            bot.answer_callback_query(call.id, "Архивирую Нидерланды...")
+            bot.send_message(call.message.chat.id, "⏳ Создаю и отправляю резервную копию 🇳🇱 Нидерландов...")
+            success, msg = backup_manager.send_backup(bot, call.message.chat.id, target="nl")
+        elif data == "backup:fin":
+            bot.answer_callback_query(call.id, "Архивирую Финляндию...")
+            bot.send_message(call.message.chat.id, "⏳ Создаю и отправляю резервную копию 🇫🇮 Финляндии...")
+            success, msg = backup_manager.send_backup(bot, call.message.chat.id, target="fin")
+        elif data == "backup:ru":
+            bot.answer_callback_query(call.id, "Архивирую Россию...")
+            bot.send_message(call.message.chat.id, "⏳ Создаю и отправляю резервную копию 🇷🇺 России...")
+            success, msg = backup_manager.send_backup(bot, call.message.chat.id, target="ru")
+        else:
+            bot.answer_callback_query(call.id, "Архивирую все 3 сервера...")
+            bot.send_message(call.message.chat.id, "⏳ Создаю и отправляю резервные копии всех серверов (🇳🇱 + 🇫🇮 + 🇷🇺)...")
+            success, msg = backup_manager.send_backup(bot, call.message.chat.id, target="all")
+
         if not success:
             bot.send_message(call.message.chat.id, f"❌ Ошибка создания бэкапа: {msg}")
 
@@ -1023,307 +1386,14 @@ def handle_all_callbacks(call):
             parse_mode="Markdown"
         )
 
-    # --- VPN Коллбэки ---
-
-    elif data == "vpn:list":
-        bot.answer_callback_query(call.id)
-        clients = vpn_manager.get_clients_list()
-        if not clients:
-            bot.send_message(call.message.chat.id, "Клиенты пока не найдены в базе.", reply_markup=make_vpn_main_inline())
-            return
-        
-        if call.message.content_type == "photo":
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-            bot.send_message(
-                call.message.chat.id,
-                "📋 **Список активных клиентов Reality/Hysteria:**",
-                reply_markup=make_clients_list_inline(clients),
-                parse_mode="Markdown"
-            )
-        else:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text="📋 **Список активных клиентов Reality/Hysteria:**",
-                reply_markup=make_clients_list_inline(clients),
-                parse_mode="Markdown"
-            )
-
-    elif data == "vpn:new":
-        bot.answer_callback_query(call.id)
-        user_states[call.message.chat.id] = "vpn_waiting_email"
-        bot.send_message(
-            call.message.chat.id,
-            "➕ **Создание нового клиента:**\n\n"
-            "Введите имя (email) клиента (например: `Danil`, `Work_Mac`, `Максим`):",
-            parse_mode="Markdown"
-        )
-
-    elif data == "vpn_sub:random":
-        bot.answer_callback_query(call.id)
-        state = user_states.get(call.message.chat.id)
-        if isinstance(state, dict):
-            state["sub_id"] = None
-            state["step"] = "vpn_limits"
-            kb = types.InlineKeyboardMarkup()
-            kb.row(types.InlineKeyboardButton("♾ Безлимит (по умолчанию)", callback_data="vpn_lim:unlim"))
-            kb.row(types.InlineKeyboardButton("✏️ Указать ГБ и дни вручную", callback_data="vpn_lim:manual"))
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text="Выберите тарифные лимиты:",
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-
-    elif data == "vpn_sub:custom":
-        bot.answer_callback_query(call.id)
-        state = user_states.get(call.message.chat.id)
-        if isinstance(state, dict):
-            state["step"] = "vpn_waiting_sub_id"
-            bot.send_message(call.message.chat.id, "Введите желаемый ID подписки (латиница и цифры):")
-
-    elif data == "vpn_lim:unlim":
-        bot.answer_callback_query(call.id, "Создаю клиента...")
-        state = user_states.pop(call.message.chat.id, None)
-        if not isinstance(state, dict):
-            bot.send_message(call.message.chat.id, "Ошибка сессии. Повторите заново через меню.")
-            return
-
-        bot.send_message(call.message.chat.id, "⏳ Создаю клиента через официальный API 3X-UI...")
-        ok, res = vpn_manager.create_client(
-            email=state["email"],
-            sub_id=state.get("sub_id"),
-            total_gb=0,
-            days_limit=0
-        )
-
-        if not ok:
-            bot.send_message(call.message.chat.id, f"❌ Ошибка создания: `{res}`", parse_mode="Markdown")
-            return
-
-        client_data = vpn_manager.get_client_by_email(state["email"])
-        if not client_data:
-            client_data = {
-                "email": state["email"],
-                "sub_id": res,
-                "total_gb": 0,
-                "expiry_time": 0,
-                "inbound_ids": [1, 2, 3, 5],
-                "up": 0, "down": 0
-            }
-
-        card_text, raw_sub, happ_url = format_client_card(client_data)
-        qr_buf = vpn_manager.generate_qr_bytes(raw_sub)
-        kb = make_client_view_keyboard(state["email"], happ_url, client_data.get("enable", True))
-
-        bot.send_photo(
-            call.message.chat.id,
-            photo=qr_buf,
-            caption=f"✅ **Клиент успешно создан во всех 4 серверах!**\n\n{card_text}",
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-
-    elif data == "vpn_lim:manual":
-        bot.answer_callback_query(call.id)
-        state = user_states.get(call.message.chat.id)
-        if isinstance(state, dict):
-            state["step"] = "vpn_waiting_gb"
-            bot.send_message(call.message.chat.id, "Введите лимит трафика в **ГБ** (например, `50`, `100` или `0` для безлимита):")
-
-    # Просмотр конкретного клиента
-    elif data.startswith("vpn_view:"):
-        bot.answer_callback_query(call.id)
-        email = data.split(":", 1)[1]
-        client_data = vpn_manager.get_client_by_email(email)
-        if not client_data:
-            bot.send_message(call.message.chat.id, "Клиент не найден.")
-            return
-
-        card_text, raw_sub, happ_url = format_client_card(client_data)
-        kb = make_client_view_keyboard(email, happ_url, client_data.get("enable", True))
-
-        if call.message.content_type == "photo":
-            try:
-                bot.edit_message_caption(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    caption=card_text,
-                    reply_markup=kb,
-                    parse_mode="Markdown"
-                )
-                return
-            except Exception:
-                pass
-
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
-
-        qr_buf = vpn_manager.generate_qr_bytes(raw_sub)
-        bot.send_photo(
-            call.message.chat.id,
-            photo=qr_buf,
-            caption=card_text,
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-
-    # Включение/отключение клиента
-    elif data.startswith("vpn_toggle:"):
-        email = data.split(":", 1)[1]
-        c = vpn_manager.get_client_by_email(email)
-        if not c:
-            bot.answer_callback_query(call.id, "Клиент не найден")
-            return
-        new_st = not c.get("enable", True)
-        ok = vpn_manager.set_client_enabled(email, new_st)
-        st_text = "включен" if new_st else "отключен"
-        bot.answer_callback_query(call.id, f"Клиент {st_text}")
-        c["enable"] = new_st
-        card_text, raw_sub, happ_url = format_client_card(c)
-        kb = make_client_view_keyboard(email, happ_url, new_st)
-        try:
-            bot.edit_message_caption(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                caption=card_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-    # Подтверждение удаления клиента
-    elif data.startswith("vpn_del_confirm:"):
-        email = data.split(":", 1)[1]
-        bot.answer_callback_query(call.id)
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"vpn_del:{email}"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data=f"vpn_view:{email}")
-        )
-        msg_text = f"⚠️ Вы уверены, что хотите **удалить** клиента `{email}`?"
-        if call.message.content_type == "photo":
-            bot.edit_message_caption(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                caption=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-        else:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-
-    # Меню редактирования клиента
-    elif data.startswith("vpn_edit:"):
-        bot.answer_callback_query(call.id)
-        email = data.split(":", 1)[1]
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("📊 Лимит ГБ", callback_data=f"vpn_ed_gb:{email}"),
-            types.InlineKeyboardButton("⏳ Срок (дней)", callback_data=f"vpn_ed_days:{email}")
-        )
-        kb.add(types.InlineKeyboardButton("❮ Назад к клиенту", callback_data=f"vpn_view:{email}"))
-        msg_text = f"⚙️ **Редактирование профиля:** `{email}`\n\nЧто вы хотите изменить?"
-        if call.message.content_type == "photo":
-            bot.edit_message_caption(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                caption=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-        else:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-
-    elif data.startswith("vpn_ed_gb:"):
-        email = data.split(":", 1)[1]
-        user_states[call.message.chat.id] = {"step": "vpn_edit_gb", "target_email": email}
-        bot.answer_callback_query(call.id)
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("❮ Назад к клиенту", callback_data=f"vpn_view:{email}"))
-        msg_text = f"⚙️ **Изменение лимита ГБ для `{email}`**\n\nВведите новый лимит в **ГБ** ответным сообщением (0 = безлимит):"
-        if call.message.content_type == "photo":
-            bot.edit_message_caption(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                caption=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-        else:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-
-    elif data.startswith("vpn_ed_days:"):
-        email = data.split(":", 1)[1]
-        user_states[call.message.chat.id] = {"step": "vpn_edit_days", "target_email": email}
-        bot.answer_callback_query(call.id)
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("❮ Назад к клиенту", callback_data=f"vpn_view:{email}"))
-        msg_text = f"⚙️ **Изменение срока для `{email}`**\n\nВведите количество дней действия ответным сообщением от текущего момента (0 = безлимит):"
-        if call.message.content_type == "photo":
-            bot.edit_message_caption(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                caption=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-        else:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=msg_text,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-
-    # Удаление клиента
-    elif data.startswith("vpn_del:"):
-        email = data.split(":", 1)[1]
-        ok = vpn_manager.delete_client(email)
-        bot.answer_callback_query(call.id, f"Клиент {email} удален!")
-        
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
-
-        if ok:
-            bot.send_message(call.message.chat.id, f"🗑 Клиент `{email}` удален из 3X-UI через API.", parse_mode="Markdown")
-        else:
-            bot.send_message(call.message.chat.id, f"❌ Ошибка удаления `{email}`.", parse_mode="Markdown")
-
-        clients = vpn_manager.get_clients_list()
-        bot.send_message(call.message.chat.id, "📋 **Список клиентов:**", reply_markup=make_clients_list_inline(clients), parse_mode="Markdown")
-
 # --- Фоновый цикл ---
 
 def monitoring_loop():
     global last_alert_time, last_ssl_check_day, last_backup_date_str
     high_cpu_counter = 0
     alerted_failed_services = set()
+    service_alert_messages = []
+    last_remote_statuses = {}
     bg_refresh_ticks = 0
     last_ssh_check_ts = time.time()
     last_net = psutil.net_io_counters()
@@ -1375,18 +1445,66 @@ def monitoring_loop():
             newly_failed = []
             alerts_map = bot_settings.get("service_alerts_enabled", {})
 
-            for srv in config.MONITORED_SERVICES:
+            # 1. Проверка служб Нидерландов
+            nl_units = [srv["unit"] for srv in config.SERVERS["nl"]["monitored_services"]]
+            nl_statuses = get_local_systemd_statuses(nl_units)
+            for srv in config.SERVERS["nl"]["monitored_services"]:
                 unit = srv["unit"]
                 should_alert = alerts_map.get(unit, True)
-                status = get_systemd_status(unit)
+                status = nl_statuses.get(unit, "⚪ unknown")
 
                 if "🔴" in status:
-                    if unit not in alerted_failed_services:
+                    if ("nl", unit) not in alerted_failed_services:
                         if should_alert:
-                            newly_failed.append(srv)
-                        alerted_failed_services.add(unit)
-                else:
-                    alerted_failed_services.discard(unit)
+                            newly_failed.append({"server": "🇳🇱 Нидерланды", "name": srv["name"], "unit": unit, "sid": "nl"})
+                        alerted_failed_services.add(("nl", unit))
+                elif "🟢" in status:
+                    alerted_failed_services.discard(("nl", unit))
+
+            # 2. Проверка удаленных серверов (Финляндия и Россия, раз в ~12-15 сек)
+            if bg_refresh_ticks % 4 == 0:
+                for r_sid in [k for k, v in config.SERVERS.items() if not v.get("is_local", True)]:
+                    r_conf = config.SERVERS[r_sid]
+                    r_units = [srv["unit"] for srv in r_conf.get("monitored_services", [])]
+                    r_statuses = remote_monitor.get_remote_systemd_statuses(r_units, server_id=r_sid)
+                    last_remote_statuses[r_sid] = r_statuses
+                    r_label = f"{r_conf['flag']} {r_conf['name']}"
+                    for srv in r_conf.get("monitored_services", []):
+                        unit = srv["unit"]
+                        should_alert = alerts_map.get(unit, True)
+                        status = r_statuses.get(unit, "⚪ unknown")
+                        if "🔴" in status:
+                            if (r_sid, unit) not in alerted_failed_services:
+                                if should_alert:
+                                    newly_failed.append({"server": r_label, "name": srv["name"], "unit": unit, "sid": r_sid})
+                                alerted_failed_services.add((r_sid, unit))
+                        elif "🟢" in status:
+                            alerted_failed_services.discard((r_sid, unit))
+
+            # Проверка восстановления упавших служб и удаление неактуальных алертов
+            if service_alert_messages:
+                remaining_alerts = []
+                for alert in service_alert_messages:
+                    all_recovered = True
+                    for sid, unit in alert["units"]:
+                        st = nl_statuses.get(unit, "") if sid == "nl" else last_remote_statuses.get(sid, {}).get(unit, "")
+                        if "🟢" not in st:
+                            all_recovered = False
+                            break
+
+                    if all_recovered:
+                        for chat_id, msg_id in alert["messages"]:
+                            if msg_id == active_dashboard_msg.get("message_id"):
+                                continue
+                            try:
+                                bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                                log.info(f"Службы {alert['units']} восстановились. Удалено неактуальное сообщение об алерте (chat_id={chat_id}, msg_id={msg_id})")
+                            except Exception as del_err:
+                                log.debug(f"Не удалось удалить сообщение алертов {msg_id}: {del_err}")
+                    else:
+                        if now_ts - alert.get("created_at", now_ts) < 86400:
+                            remaining_alerts.append(alert)
+                service_alert_messages = remaining_alerts
 
             if newly_failed:
                 trigger_alert = True
@@ -1427,48 +1545,87 @@ def monitoring_loop():
             bg_refresh_ticks += 1
             if bg_refresh_ticks % 2 == 0 and active_dashboard_msg["message_id"]:
                 try:
-                    new_body = build_services_text()
+                    cur_srv = active_dashboard_msg.get("server_id", "nl")
+                    new_body = build_services_text(cur_srv)
                     if new_body != active_dashboard_msg["last_content"]:
                         active_dashboard_msg["last_content"] = new_body
                         bot.edit_message_text(
                             chat_id=active_dashboard_msg["chat_id"],
                             message_id=active_dashboard_msg["message_id"],
                             text=new_body,
-                            reply_markup=make_services_inline(),
+                            reply_markup=make_services_inline(cur_srv),
                             parse_mode="Markdown"
                         )
                 except Exception:
                     pass
 
             curr_time = time.time()
-            if trigger_alert and ((curr_time - last_alert_time > config.ALERT_COOLDOWN) or newly_failed):
+            if newly_failed:
+                # 1. Специализированный алерт о сбое системной службы
+                markup = types.InlineKeyboardMarkup()
+                if len(newly_failed) == 1:
+                    s = newly_failed[0]
+                    sid = s.get("sid", "nl")
+                    srv_name = s.get("server", "🇳🇱 Нидерланды")
+                    reason = diagnose_service_failure(sid, s["unit"], s["name"])
+
+                    msg = (
+                        f"🚨 **СБОЙ СИСТЕМНОЙ СЛУЖБЫ**\n\n"
+                        f"• **Служба:** {s['name']} (`{s['unit']}`)\n"
+                        f"• **Сервер:** {srv_name}\n\n"
+                        f"💡 **Вероятная причина:**\n{reason}"
+                    )
+                    btn_start = types.InlineKeyboardButton(f"▶️ Запустить {s['name']}", callback_data=f"srv:{sid}:start:{s['unit']}")
+                    btn_restart = types.InlineKeyboardButton(f"🔄 Рестарт {s['name']}", callback_data=f"srv:{sid}:restart:{s['unit']}")
+                    markup.row(btn_start, btn_restart)
+                else:
+                    msg = f"🚨 **СБОЙ СИСТЕМНЫХ СЛУЖБ**\n\n"
+                    blocks = []
+                    for idx, s in enumerate(newly_failed, 1):
+                        sid = s.get("sid", "nl")
+                        srv_name = s.get("server", "🇳🇱 Нидерланды")
+                        reason = diagnose_service_failure(sid, s["unit"], s["name"])
+                        blocks.append(
+                            f"{idx}️⃣ **{s['name']}** (`{s['unit']}`)\n"
+                            f"• **Сервер:** {srv_name}\n"
+                            f"• **Причина:** {reason}"
+                        )
+                        btn_start = types.InlineKeyboardButton(f"▶️ Запустить {s['name']}", callback_data=f"srv:{sid}:start:{s['unit']}")
+                        btn_restart = types.InlineKeyboardButton(f"🔄 Рестарт {s['name']}", callback_data=f"srv:{sid}:restart:{s['unit']}")
+                        markup.row(btn_start, btn_restart)
+                    msg += "\n\n".join(blocks)
+
+                sent_msgs = notify_admins(msg, reply_markup=markup if markup.keyboard else None)
+                if sent_msgs:
+                    failed_keys = {(s["sid"], s["unit"]) for s in newly_failed}
+                    msg_targets = [(m.chat.id, m.message_id) for m in sent_msgs if getattr(m, "message_id", None)]
+                    if msg_targets:
+                        service_alert_messages.append({
+                            "units": failed_keys,
+                            "messages": msg_targets,
+                            "created_at": curr_time
+                        })
+
+            elif trigger_alert and (curr_time - last_alert_time > config.ALERT_COOLDOWN):
+                # 2. Алерт о высокой системной нагрузке (если службы не падали)
                 last_alert_time = curr_time
                 procs_data = get_top_cpu_data(limit=4)
                 system_summary = analyzer.get_system_summary()
 
                 msg = (
-                    f"⚠️ **ВНИМАНИЕ: Срабатывание триггера VPS!**\n\n"
-                    f"🚨 **Причина:**\n• " + "\n• ".join(alert_reasons) + "\n"
+                    f"⚠️ **ВНИМАНИЕ: Высокая нагрузка VPS!**\n\n"
+                    f"🚨 **Причина:**\n• " + "\n• ".join(alert_reasons) + "\n\n"
                 )
-
-                markup = types.InlineKeyboardMarkup()
-                if newly_failed:
-                    msg += f"\n❌ **Остановлены службы:** `{', '.join([s['name'] for s in newly_failed])}`\n"
-                    for s in newly_failed:
-                        btn_start = types.InlineKeyboardButton(f"▶️ Запустить {s['name']}", callback_data=f"srv:start:{s['unit']}")
-                        btn_restart = types.InlineKeyboardButton(f"🔄 Рестарт {s['name']}", callback_data=f"srv:restart:{s['unit']}")
-                        markup.row(btn_start, btn_restart)
 
                 if procs_data:
                     top_lines = []
-                    for name, pid, cpu, desc in procs_data:
+                    for item in procs_data:
+                        name, pid, cpu, *_, desc = item
                         top_lines.append(f"• `{name}` (PID {pid}): **{cpu:.1f}%**\n  └ *{desc}*")
-                        if cpu > 15.0 and not any(p in name.lower() for p in config.PROTECTED_PROCESSES):
-                            markup.add(types.InlineKeyboardButton(f"☠️ Убить {name[:12]} (PID {pid})", callback_data=f"kill:{pid}:{name}"))
-                    msg += f"\n📈 **Виновники нагрузки прямо сейчас:**\n" + "\n".join(top_lines) + "\n\n"
+                    msg += f"📈 **Топ процессов по нагрузке:**\n" + "\n".join(top_lines) + "\n\n"
 
                 msg += f"📊 **Сводка системы:**\n{system_summary}"
-                notify_admins(msg, reply_markup=markup if markup.keyboard else None)
+                notify_admins(msg)
 
         except Exception as e:
             log.exception("Ошибка в фоновом цикле мониторинга")

@@ -14,7 +14,7 @@ log = logging.getLogger("server_guard.vpn")
 
 SERVER_IP = "1.2.3.4"
 PANEL_PORT = 44506
-BASE_PATH = "/3x-ui-panel"
+BASE_PATH = "/3x"
 
 try:
     import config as _config  # подгружает .env
@@ -23,13 +23,13 @@ except Exception:
 import os as _os
 
 DOMAIN = getattr(_config, "DOMAIN", "example.com") if _config else "example.com"
-
+if not DOMAIN:
+    DOMAIN = "example.com"
 SERVER_IP = getattr(_config, "SERVER_IP", SERVER_IP) if _config else SERVER_IP
 BASE_PATH = getattr(_config, "BASE_PATH", BASE_PATH) if _config else BASE_PATH
 BASE_PATH = "/" + BASE_PATH.strip("/")
 
-API_TOKEN = "YOUR_3XUI_API_TOKEN"
-API_TOKEN = _os.environ.get("XUI_API_TOKEN", API_TOKEN)
+API_TOKEN = _os.environ.get("XUI_API_TOKEN", "your_3xui_bearer_token_here")
 
 # Базовый URL панели 3X-UI (по умолчанию локально с verify=False)
 PANEL_BASE_URL = _os.environ.get("XUI_BASE_URL", f"https://127.0.0.1:{PANEL_PORT}{BASE_PATH}").rstrip("/")
@@ -303,4 +303,3 @@ def extend_client(email, add_days=0, add_gb=0):
 
     ok = _push_update(email, client, total_bytes, expiry_ts, client.get("enable", True))
     return ok, ("Готово" if ok else "Панель 3X-UI не приняла изменения")
-
