@@ -11,6 +11,8 @@ except ImportError:
 
 def get_fail2ban_stats():
     """Сбор статистики активных банов Fail2Ban."""
+    if not shutil.which("fail2ban-client"):
+        return None, None, []
     try:
         res = subprocess.run(["fail2ban-client", "status", "sshd"], capture_output=True, text=True, timeout=3)
         banned = 0
@@ -30,6 +32,8 @@ def get_fail2ban_stats():
 
 def unban_ip(ip):
     """Разбан конкретного IP-адреса."""
+    if not shutil.which("fail2ban-client"):
+        return "Утилита fail2ban-client не установлена в системе."
     try:
         res = subprocess.run(["fail2ban-client", "set", "sshd", "unbanip", ip], capture_output=True, text=True, timeout=3)
         return "✅ IP успешно разблокирован" if "1" in res.stdout else f"Ответ Fail2Ban: {res.stdout.strip()}"
@@ -39,7 +43,7 @@ def unban_ip(ip):
 def check_ssl_expiry(cert_path=None):
     """Проверка оставшихся дней действия сертификата Let's Encrypt."""
     if not cert_path:
-        domain = getattr(config, "DOMAIN", "bbumn.ru") if config else "bbumn.ru"
+        domain = getattr(config, "DOMAIN", "localhost") if config else "localhost"
         candidate = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
         if os.path.exists(candidate):
             cert_path = candidate
@@ -96,28 +100,23 @@ def renew_ssl():
     except Exception as e:
         msg = f"❌ **Ошибка при обновлении сертификата:** {e}"
     finally:
-        # Гарантированно поднимаем и перезапускаем все веб- и прокси-службы
-        subprocess.run(["systemctl", "restart", "x-ui"], check=False)
+        # Гарантированно поднимаем веб-сервер
         subprocess.run(["systemctl", "start", "nginx"], check=False)
         time.sleep(1.5)
         # Контрольный статус
         ng_st = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True).stdout.strip()
-        xui_st = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
-        msg += f"\n\n🛠 **Статус служб после операции:**\n• Nginx: `{ng_st}`\n• 3X-UI: `{xui_st}`"
+        msg += f"\n\n🛠 **Статус служб после операции:**\n• Nginx: `{ng_st}`"
 
     return msg
 
-def run_speedtest(server_id="nl"):
-    """Замер скорости канала VPS (локально NL или через SSH на Финляндии / России)."""
-    fin_ip = config.SERVERS.get("fin", {}).get("ip", "201.58.188.206") if hasattr(config, "SERVERS") else "201.58.188.206"
-    ru_ip = config.SERVERS.get("ru", {}).get("ip", "62.173.152.111") if hasattr(config, "SERVERS") else "62.173.152.111"
-    remote_map = {
-        "fin": (f"root@{fin_ip}", "🇫🇮 Финляндия"),
-        "ru": (f"root@{ru_ip}", "🇷🇺 Россия"),
-    }
+def run_speedtest(server_id="main"):
+    """Замер скорости канала VPS (локально или через SSH при мультисерверности)."""
+    srv = config.SERVERS.get(server_id, next(iter(config.SERVERS.values())) if hasattr(config, "SERVERS") and config.SERVERS else {})
+    target_flag = f"{srv.get('flag', '🖥')} {srv.get('name', 'Сервер')}"
+    is_local = srv.get("is_local", True)
     try:
-        if server_id in remote_map:
-            r_host, target_flag = remote_map[server_id]
+        if not is_local and srv.get("ip"):
+            r_host = f"root@{srv['ip']}"
             remote_py = "\n".join([
                 "import subprocess, json, shutil",
                 "try:",

@@ -1,16 +1,13 @@
 param(
     [string[]]$Files = @(
         "main.py",
-        "vpn_manager.py",
         "analyzer.py",
         "backup_manager.py",
         "card_generator.py",
         "metrics_store.py",
         "security_tools.py",
         "maintenance.py",
-        "remote_monitor.py",
-        "vpn_diagnostics.py",
-        "happ_sub_adapter.py"
+        "remote_monitor.py"
     ),
     [switch]$WithConfig
 )

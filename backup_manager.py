@@ -5,71 +5,25 @@ import tempfile
 import shutil
 import glob
 import telebot
+import config
 
-BACKUP_PATHS = [
-    # 1. Сетевые профили, ключи и сертификаты
-    "/etc/x-ui/x-ui.db",                 # База клиентов, ключей и настроек 3X-UI Reality
-    "/etc/letsencrypt/live/bbumn.ru",    # Боевой SSL-сертификат домена Let's Encrypt
-    "/etc/letsencrypt/archive/bbumn.ru", # Архивы ключей Let's Encrypt
-    "/etc/letsencrypt/renewal/bbumn.ru.conf", # Конфиг автопродления certbot
-    "/etc/letsencrypt/renewal-hooks/deploy/restart-xui.sh", # Хук перезапуска Xray
-    "/root/wgcf-account.toml",           # Учетная запись Cloudflare WARP
-    "/root/wgcf-profile.conf",           # Конфигурация интерфейса WARP / wireproxy
-    "/root/.ssh/authorized_keys",        # SSH-ключи для входа без пароля
-    "/root/.ssh/id_ed25519",             # Приватный SSH-ключ для связи с нодами (Финляндия)
-    "/root/.ssh/config",                 # Конфигурация SSH-соединений
-    "/root/.ssh/github_server_guard",    # SSH-ключ деплоя репозиториев
-
-    # 2. Веб-инфраструктура (Nginx)
-    "/etc/nginx/nginx.conf",             # Главный конфиг Nginx
-    "/etc/nginx/sites-available",        # Виртуальные хосты (визитка, Mini App, proxy)
-    "/etc/nginx/conf.d",                 # Дополнительные конфиги Nginx (mobileconfig и др.)
-    "/var/www/html",                     # Веб-страницы (index.html, compare_app, arcade, olya, go.html)
-
+# Базовые системные директории и конфиги для бэкапа по умолчанию
+DEFAULT_BACKUP_PATHS = [
+    # 1. Веб-сервер
+    "/etc/nginx",
+    # 2. Безопасность и фаервол
+    "/etc/fail2ban",
+    "/etc/ufw",
+    "/etc/ssh/sshd_config",
     # 3. Службы автозапуска systemd
     "/etc/systemd/system/server_guard.service",
-    "/etc/systemd/system/mem_bot.service",
-    "/etc/systemd/system/flashcard_bot.service",
-    "/etc/systemd/system/jupyter.service",
-    "/etc/systemd/system/wireproxy.service",
-    "/etc/systemd/system/anonchat_bot.service",
-    "/etc/systemd/system/weektrack.service",
-    "/etc/systemd/system/antigravity-bot.service",
-    "/etc/systemd/system/arcade-hub.service",
-    "/etc/systemd/system/vpn_guard.service",
-    "/etc/systemd/system/happ-sub-adapter.service",
-    "/etc/systemd/system/beszel-agent.service",
-    "/etc/systemd/system/beszel-hub.service",
-    "/etc/systemd/system/tproxy-firewall.service",
-    "/etc/systemd/system/tproxy-server.service",
-    "/etc/systemd/system/mtproxy.service",
-    "/etc/systemd/system/x-ui.service",
-
-    # 4. Проекты, боты и базы данных
-    "/root/server_guard",                # Код сторожа и settings.json
-    "/root/antigravity_bot",             # Antigravity AI Telegram-бот (.env, код)
-    "/root/vpn_guard",                   # bumVPN Guard Telegram-бот (.env, код)
-    "/opt/apps/mem_bot",                 # Код мем-бота и все шрифты .ttf
-    "/opt/apps/flashcard_bot",           # Код бота и flashcards.db
-    "/home/jupyter/notebooks",           # Учебные тетради Jupyter МИРЭА
-    "/opt/apps/anonchat_bot",            # Анонимный чат бот
-    "/opt/weektrack_bot",                # Telegram-бот WeekTrack (код, weektrack.sqlite3, .env)
-    "/opt/arcade-hub",                   # Платформа Arcade Hub (код, конфиги)
-    "/var/lib/arcade-hub/arcade.sqlite", # База данных Arcade Hub
-    "/etc/arcade-hub.env",               # Переменные окружения Arcade Hub
-    "/opt/vaultwarden/docker-compose.yml", # Конфигурация Docker Vaultwarden
-    "/opt/vaultwarden/data/db.sqlite3",  # База паролей Vaultwarden
-    "/opt/vaultwarden/data/rsa_key.pem", # Ключи шифрования Vaultwarden
-    "/opt/beszel/beszel_data",           # База метрик и ключи Beszel Hub
-
-    # 5. Защита и прокси
-    "/etc/fail2ban/jail.d",              # Боевые правила джейлов Fail2Ban (3X-UI и др.)
-    "/etc/ufw/user.rules",               # Пользовательские правила UFW (IPv4)
-    "/etc/ufw/user6.rules",              # Пользовательские правила UFW (IPv6)
-    "/etc/ufw/before.rules",             # Системные правила маршрутизации UFW
-    "/etc/ufw/after.rules",              # Пост-правила UFW
-    "/etc/tproxy-server",                # Конфигурация MTProxy / tproxy (firewall.nft, token.key)
+    # 4. Рабочая папка самого бота
+    os.path.dirname(os.path.abspath(__file__)),
 ]
+
+# Пользовательские пути из config.py / .env
+CUSTOM_PATHS = getattr(config, "BACKUP_DIRECTORIES", [])
+BACKUP_PATHS = list(dict.fromkeys(DEFAULT_BACKUP_PATHS + CUSTOM_PATHS))
 
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -77,7 +31,7 @@ def make_backup_archive():
     """Создает компактный tar.gz архив без мусора (venv, node_modules, git, cache, db-wal, metrics.db)."""
     now_msk = datetime.datetime.now(MSK_TZ)
     date_str = now_msk.strftime("%Y-%m-%d_%H-%M")
-    archive_name = f"backup_bum3n_{date_str}.tar.gz"
+    archive_name = f"backup_server_{date_str}.tar.gz"
     temp_dir = tempfile.gettempdir()
     archive_path = os.path.join(temp_dir, archive_name)
 

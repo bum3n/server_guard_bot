@@ -122,11 +122,19 @@ def save_settings(settings):
 bot_settings = load_settings()
 IGNORED_HIGH_CPU_PROCESSES = ["apt-check", "unattended-upgr", "dpkg", "apt-get", "apt"]
 
+def get_default_server_id():
+    if hasattr(config, "SERVERS") and config.SERVERS:
+        return next(iter(config.SERVERS.keys()))
+    return "main"
+
 def get_active_server_id(chat_id):
     if chat_id in user_servers:
         return user_servers[chat_id]
+    default_id = get_default_server_id()
     servers_map = bot_settings.get("user_servers", {})
-    val = servers_map.get(str(chat_id), servers_map.get(chat_id, "nl"))
+    val = servers_map.get(str(chat_id), servers_map.get(chat_id, default_id))
+    if val not in config.SERVERS:
+        val = default_id
     user_servers[chat_id] = val
     return val
 
@@ -139,7 +147,8 @@ def set_active_server_id(chat_id, server_id):
 
 def get_active_server_conf(chat_id):
     sid = get_active_server_id(chat_id)
-    return config.SERVERS.get(sid, config.SERVERS["nl"])
+    default_id = get_default_server_id()
+    return config.SERVERS.get(sid, config.SERVERS.get(default_id, {}))
 
 def get_systemd_status(unit_name):
     res = get_local_systemd_statuses([unit_name])
@@ -383,28 +392,10 @@ def get_process_description(proc, name):
         if any(name_lower.startswith(kp) for kp in kernel_prefixes) or name_lower in ("kthreadd",):
             return "Системный поток ядра Linux"
 
-    # 2. Python процессы и Telegram-боты
+    # 2. Python процессы
     if name_lower.startswith("python") or "python" in cmd_str:
         if "server_guard" in cmd_str:
             return "Бот мониторинга Server Guard"
-        if "antigravity" in cmd_str or "bumagent" in cmd_str:
-            return "Telegram-бот Antigravity Agent (@bumagent_bot)"
-        if "vpn_guard" in cmd_str or "bumvpn" in cmd_str:
-            return "Telegram-бот bumVPN Guard (@bumvpnguard_bot)"
-        if "happ_sub_adapter" in cmd_str or "happ" in cmd_str:
-            return "Адаптер подписок Happ (happ-sub-adapter)"
-        if "membot" in cmd_str or "mem_bot" in cmd_str:
-            return "Telegram-бот MemBot"
-        if "flashcard" in cmd_str:
-            return "Telegram-бот FlashCard Bot"
-        if "anonchat" in cmd_str:
-            return "Telegram-бот AnonChat Bot"
-        if "weektrack" in cmd_str:
-            return "Telegram-бот WeekTrack (расписание и маршруты)"
-        if "ipykernel" in cmd_str:
-            return "Интерактивное ядро Jupyter Notebook"
-        if "jupyter" in cmd_str:
-            return "Среда разработки Jupyter Lab"
         if "speedtest" in cmd_str:
             return "Тест скорости сети VPS (speedtest-cli)"
         if "fail2ban" in cmd_str:
@@ -424,28 +415,21 @@ def get_process_description(proc, name):
 
     # 3. Известные демоны и службы
     known = {
-        "xray": "Ядро прокси Xray (шифрование и передача трафика)",
-        "x-ui": "Панель управления 3X-UI (веб-интерфейс и база)",
-        "wireproxy": "Клиент WireProxy (SOCKS5 прокси WARP)",
-        "warp-svc": "Клиент Cloudflare WARP (socks5 прокси)",
         "systemd-resolved": "Системный DNS-резолвер Linux",
         "sshd": "Служба удаленного доступа SSH",
         "nginx": "Веб-сервер и reverse proxy Nginx",
+        "caddy": "Веб-сервер Caddy (авто-HTTPS)",
+        "apache2": "Веб-сервер Apache",
         "fail2ban": "Защита от брутфорса и автобан IP",
-        "jupyter": "Среда разработки Jupyter Lab",
-        "arcade-hub": "Сервер интерактивных игр Arcade Hub (Node.js)",
-        "arcade": "Сервер интерактивных игр Arcade Hub (Node.js)",
-        "node": "Сервер интерактивных игр Arcade Hub (Node.js)" if "arcade" in cmd_str else "Среда выполнения Node.js",
-        "beszel-hub": "Центральный сервер мониторинга Beszel Hub",
-        "beszel-agent": "Агент сбора метрик Beszel Agent",
-        "beszel": "Сервер мониторинга Beszel Hub",
-        "vaultwarden": "Менеджер паролей Vaultwarden (Docker)",
-        "docker-proxy": "Прокси сетевых портов Docker (Vaultwarden)",
+        "node": "Среда выполнения Node.js / JavaScript",
+        "docker-proxy": "Сетевой прокси контейнеров Docker",
         "containerd-shim": "Контейнерный рантайм containerd-shim",
-        "docker": "Контейнеризация Docker",
+        "docker": "Контейнеризация Docker Engine",
         "containerd": "Среда выполнения контейнеров containerd",
-        "mtg": "MTProto Telegram Proxy",
-        "adguard": "Блокировщик рекламы и трекеров AdGuard Home",
+        "postgres": "Реляционная СУБД PostgreSQL",
+        "mysqld": "Реляционная СУБД MySQL / MariaDB",
+        "redis-server": "In-memory хранилище Redis",
+        "mongod": "Документоориентированная СУБД MongoDB",
         "multipathd": "Служба отказоустойчивости дисков Multipath",
         "systemd-journal": "Служба сбора системных журналов и логов",
         "rsyslog": "Системный демон логирования",
@@ -549,7 +533,7 @@ NUM_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", 
 
 def build_top_procs_text_and_kb(mode="cpu", server_id="nl"):
     kb = types.InlineKeyboardMarkup()
-    srv_conf = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    srv_conf = config.SERVERS.get(server_id, config.SERVERS[get_default_server_id()])
     srv_flag = srv_conf.get("flag", "🌐")
     srv_name = srv_conf.get("name", server_id)
     is_local = srv_conf.get("is_local", True)
@@ -651,7 +635,7 @@ def build_top_procs_text_and_kb(mode="cpu", server_id="nl"):
     return full_text, kb
 
 def format_system_text(server_id="nl"):
-    srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    srv = config.SERVERS.get(server_id, config.SERVERS[get_default_server_id()])
     if srv.get("is_local", True):
         cpu = psutil.cpu_percent(interval=1)
         ram = psutil.virtual_memory()
@@ -690,7 +674,7 @@ def format_system_text(server_id="nl"):
 
 def make_status_inline(server_id="nl"):
     kb = types.InlineKeyboardMarkup()
-    srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    srv = config.SERVERS.get(server_id, config.SERVERS[get_default_server_id()])
     if srv.get("is_local", True):
         kb.row(
             types.InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_metrics:{server_id}"),
@@ -705,11 +689,15 @@ def make_status_inline(server_id="nl"):
 
 def make_reply_keyboard(chat_id=None):
     active_sid = get_active_server_id(chat_id)
-    active_conf = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    default_id = get_default_server_id()
+    active_conf = config.SERVERS.get(active_sid, config.SERVERS.get(default_id, {}))
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    # Верхняя кнопка переключения текущего сервера
-    markup.row(f"🌐 Сервер: {active_conf['flag']} {active_conf['name']} ⮂")
+    # Верхняя кнопка переключения отображается только при наличии нескольких нод
+    if len(config.SERVERS) > 1:
+        flag = active_conf.get('flag', '🖥')
+        name = active_conf.get('name', 'Сервер')
+        markup.row(f"🌐 Сервер: {flag} {name} ⮂")
     markup.row("📊 Метрики", "🔗 Ссылки на сервисы", "🛠 Службы и Сайты")
     markup.row("🔝 Топ процессов", "🚀 Тест скорости")
     markup.row("📦 Бэкап сервера", "🛡 Защита Fail2Ban")
@@ -718,7 +706,7 @@ def make_reply_keyboard(chat_id=None):
 
 def make_services_inline(server_id="nl"):
     kb = types.InlineKeyboardMarkup()
-    srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+    srv = config.SERVERS.get(server_id, config.SERVERS[get_default_server_id()])
     is_local = srv.get("is_local", True)
     services = srv.get("monitored_services", config.MONITORED_SERVICES)
 
@@ -742,37 +730,50 @@ def make_services_inline(server_id="nl"):
     kb.add(types.InlineKeyboardButton("🔄 Обновить список статусов", callback_data=f"refresh_services:{server_id}"))
     return kb
 
-SERVICE_LINKS = [
-    [("🌐 Главный сайт", "https://bbumn.ru/"), ("🖼 Compare App", "https://bbumn.ru/compare/")],
-    [("🕹 Arcade Hub", "https://bbumn.ru/arcade/"), ("🔒 Vaultwarden", "https://bbumn.ru/vault/")],
-    [("📊 Beszel Monitor", "https://bbumn.ru/monitor/"), ("🛡 Smart DNS", "https://dns.bbumn.ru/")],
-    [("📓 Jupyter Lab", "https://bbumn.ru/jupyter/"), ("🔑 Панель 3X-UI", "https://bbumn.ru/3x/")],
-    [("🛡 AdGuard Home", "https://bbumn.ru/adguard/"), ("🧠 Antigravity Agent", "https://t.me/bumagent_bot")],
-    [("🤖 bumVPN Guard", "https://t.me/bumvpnguard_bot"), ("📅 WeekTrack", "https://t.me/weektrack_bot")],
-    [("🎭 AnonChat Bot", "https://t.me/anonchatbum_bot"), ("🃏 FlashCard Bot", "https://t.me/gencarttbot")],
-    [("🤖 MemBot", "https://t.me/bumnmembot")],
-]
+def get_service_links():
+    """Возвращает список ссылок на сервисы из настроек бота."""
+    if "service_links" in bot_settings:
+        return bot_settings["service_links"]
+    default_links = [
+        {"title": "🌐 Главный сайт / API", "url": f"https://{config.DOMAIN}/" if config.DOMAIN != "localhost" else f"http://{config.SERVER_IP}/"}
+    ]
+    return default_links
 
 def make_links_inline():
     kb = types.InlineKeyboardMarkup()
-    for row in SERVICE_LINKS:
-        kb.row(*[types.InlineKeyboardButton(title, url=url) for title, url in row])
+    links = get_service_links()
+    row = []
+    for item in links:
+        title = item.get("title", "Сервис")
+        url = item.get("url", "#")
+        row.append(types.InlineKeyboardButton(title, url=url))
+        if len(row) == 2:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
+    kb.row(types.InlineKeyboardButton("⚙️ Настроить ссылки", callback_data="cfg:links_menu"))
     return kb
 
-DEFAULT_HTTP_CHECKS = [
-    {"name": "Главный сайт", "url": "https://bbumn.ru/"},
-    {"name": "Compare App", "url": "https://bbumn.ru/compare/"},
-    {"name": "Arcade Hub", "url": "https://bbumn.ru/arcade/"},
-    {"name": "Vaultwarden", "url": "https://bbumn.ru/vault/"},
-    {"name": "Beszel Monitor", "url": "https://bbumn.ru/monitor/"},
-    {"name": "Smart DNS", "url": "https://dns.bbumn.ru/"},
-    {"name": "AdGuard Home UI", "url": "https://bbumn.ru/adguard/"},
-    {"name": "Jupyter Lab", "url": "https://bbumn.ru/jupyter/"}
-]
+def make_links_config_inline():
+    kb = types.InlineKeyboardMarkup()
+    links = get_service_links()
+    for idx, item in enumerate(links):
+        title = item.get("title", f"Ссылка #{idx+1}")
+        kb.row(
+            types.InlineKeyboardButton(f"🔗 {title}", url=item.get("url", "#")),
+            types.InlineKeyboardButton("❌ Удалить", callback_data=f"cfg_link_del:{idx}")
+        )
+    kb.row(types.InlineKeyboardButton("➕ Добавить новую ссылку", callback_data="cfg_link_add"))
+    kb.row(types.InlineKeyboardButton("❮ Назад в Настройки", callback_data="cfg:back_main"))
+    return kb
 
-def build_services_text(server_id="nl"):
-    srv_conf = config.SERVERS.get(server_id, config.SERVERS["nl"])
-    flag = srv_conf.get("flag", "🌐")
+def build_services_text(server_id=None):
+    if not server_id:
+        server_id = get_default_server_id()
+    default_id = get_default_server_id()
+    srv_conf = config.SERVERS.get(server_id, config.SERVERS.get(default_id, {}))
+    flag = srv_conf.get("flag", "🖥")
     name = srv_conf.get("name", server_id)
     is_local = srv_conf.get("is_local", True)
     services = srv_conf.get("monitored_services", config.MONITORED_SERVICES)
@@ -859,6 +860,7 @@ def make_settings_main_inline():
     rep_status = "🟢 ВКЛ" if bot_settings.get("daily_report_enabled", True) else "🔴 ВЫКЛ"
     kb.row(types.InlineKeyboardButton(f"📊 Ежедневный отчет ({bot_settings.get('daily_report_time', '09:00')}): {rep_status}", callback_data="cfg:toggle_report"))
     kb.row(types.InlineKeyboardButton("🔔 Настройка уведомлений служб ❯", callback_data="cfg:menu_services"))
+    kb.row(types.InlineKeyboardButton("🔗 Управление ссылками на сервисы ❯", callback_data="cfg:links_menu"))
     return kb
 
 def make_service_alerts_inline():
@@ -879,7 +881,7 @@ def handle_start(message):
     if not is_admin(message.chat.id):
         return
     active_sid = get_active_server_id(message.chat.id)
-    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    srv = config.SERVERS.get(active_sid, config.SERVERS[get_default_server_id()])
     bot.send_message(
         message.chat.id,
         "🛡 **Центр управления VPS Server Guard активен.**\n"
@@ -894,7 +896,7 @@ def handle_status_cmd(message):
     if not is_admin(message.chat.id):
         return
     active_sid = get_active_server_id(message.chat.id)
-    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    srv = config.SERVERS.get(active_sid, config.SERVERS[get_default_server_id()])
     msg_text, cpu, ram, swap, disk, sub = format_system_text(active_sid)
     photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub, title=f"СТАТУС РЕСУРСОВ VPS ({srv['name'].upper()})")
     bot.send_photo(message.chat.id, photo_buf, caption=msg_text, reply_markup=make_status_inline(active_sid), parse_mode="Markdown")
@@ -911,7 +913,7 @@ def handle_speedtest_cmd(message):
     if not is_admin(message.chat.id):
         return
     active_sid = get_active_server_id(message.chat.id)
-    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    srv = config.SERVERS.get(active_sid, config.SERVERS[get_default_server_id()])
     bot.send_message(message.chat.id, f"⏳ Запускаю замер скорости канала VPS ({srv['flag']} {srv['name']}, 30-40 сек)...")
     bot.send_chat_action(message.chat.id, 'typing')
     res = analyzer.run_speedtest(server_id=active_sid)
@@ -922,7 +924,7 @@ def handle_logs_cmd(message):
     if not is_admin(message.chat.id):
         return
     active_sid = get_active_server_id(message.chat.id)
-    srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+    srv = config.SERVERS.get(active_sid, config.SERVERS[get_default_server_id()])
     if srv.get("is_local", True):
         logs = analyzer.get_critical_logs(lines=15)
     else:
@@ -1013,10 +1015,38 @@ def handle_text(message):
             bot.send_message(message.chat.id, "❌ Введите время в формате `ЧЧ:ММ` (например, `22:00` или `23`):")
             return
 
-    # --- Переключение активного сервера (nl -> fin -> ru -> nl) ---
-    if "Сервер:" in text or "⮂" in text:
+    # 2. Добавление ссылки на сервис
+    if state == "waiting_for_service_link":
+        raw = text.strip()
+        if "|" in raw:
+            parts = raw.split("|", 1)
+            title = parts[0].strip()
+            url = parts[1].strip()
+            if not url.startswith("http://") and not url.startswith("https://"):
+                url = "https://" + url
+            links = bot_settings.setdefault("service_links", get_service_links().copy())
+            links.append({"title": title, "url": url})
+            save_settings(bot_settings)
+            user_states.pop(message.chat.id, None)
+            bot.send_message(
+                message.chat.id,
+                f"✅ Ссылка **{title}** (`{url}`) успешно сохранена!\nОна доступна в разделе «Ссылки на сервисы».",
+                reply_markup=make_links_config_inline(),
+                parse_mode="Markdown"
+            )
+            return
+        else:
+            bot.send_message(
+                message.chat.id,
+                "⚠️ Неверный формат. Пришлите в виде:\n`Название | https://url`\n\nИли нажмите /menu для отмены.",
+                parse_mode="Markdown"
+            )
+            return
+
+    # --- Переключение активного сервера (если серверов > 1) ---
+    if ("Сервер:" in text or "⮂" in text) and len(config.SERVERS) > 1:
         cur_sid = get_active_server_id(message.chat.id)
-        order = [sid for sid in ("nl", "fin", "ru") if sid in config.SERVERS]
+        order = list(config.SERVERS.keys())
         idx = order.index(cur_sid) if cur_sid in order else 0
         next_sid = order[(idx + 1) % len(order)]
         set_active_server_id(message.chat.id, next_sid)
@@ -1036,7 +1066,7 @@ def handle_text(message):
 
     if "Метрики" in text:
         msg_text, cpu, ram, swap, disk, sub = format_system_text(active_sid)
-        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        srv = config.SERVERS.get(active_sid, config.SERVERS[get_default_server_id()])
         photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub, title=f"СТАТУС РЕСУРСОВ VPS ({srv['name'].upper()})")
         bot.send_photo(message.chat.id, photo_buf, caption=msg_text, reply_markup=make_status_inline(active_sid), parse_mode="Markdown")
 
@@ -1072,7 +1102,7 @@ def handle_text(message):
         bot.send_message(message.chat.id, msg, reply_markup=make_settings_main_inline(), parse_mode="Markdown")
 
     elif "Тест скорости" in text:
-        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        srv = config.SERVERS.get(active_sid, config.SERVERS[get_default_server_id()])
         srv_name = f"{srv['flag']} {srv['name']}"
         bot.send_message(message.chat.id, f"⏳ Запускаю замер скорости канала VPS ({srv_name}, 30-45 сек)...")
         bot.send_chat_action(message.chat.id, 'typing')
@@ -1080,11 +1110,25 @@ def handle_text(message):
         bot.send_message(message.chat.id, res, parse_mode="Markdown")
 
     elif "Защита Fail2Ban" in text:
-        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        default_id = get_default_server_id()
+        srv = config.SERVERS.get(active_sid, config.SERVERS.get(default_id, {}))
         if not srv.get("is_local", True):
             banned, total, banned_ips = remote_monitor.get_remote_fail2ban_stats(server_id=active_sid)
         else:
             banned, total, banned_ips = analyzer.get_fail2ban_stats()
+
+        if banned is None:
+            msg = (
+                f"🛡 **Fail2Ban не обнаружен на сервере {srv.get('flag', '🖥')} {srv.get('name', 'Сервер')}**\n\n"
+                "Служба Fail2Ban защищает сервер от автоматического подбора паролей по SSH.\n"
+                "Чтобы установить и включить защиту, выполните на сервере:\n"
+                "```bash\n"
+                "sudo apt update && sudo apt install -y fail2ban\n"
+                "sudo systemctl enable --now fail2ban\n"
+                "```"
+            )
+            bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+            return
 
         msg = (
             f"🛡 **Состояние Fail2Ban (защита SSH) — {srv['flag']} {srv['name']}:**\n"
@@ -1103,7 +1147,7 @@ def handle_text(message):
         bot.send_message(message.chat.id, msg, reply_markup=kb if banned_ips else None, parse_mode="Markdown")
 
     elif "Ошибки в логах" in text:
-        srv = config.SERVERS.get(active_sid, config.SERVERS["nl"])
+        srv = config.SERVERS.get(active_sid, config.SERVERS[get_default_server_id()])
         if not srv.get("is_local", True):
             logs = remote_monitor.get_remote_critical_logs(lines=15, server_id=active_sid)
         else:
@@ -1128,7 +1172,7 @@ def handle_all_callbacks(call):
             _, action, unit = parts
             server_id = "nl"
 
-        srv_conf = config.SERVERS.get(server_id, config.SERVERS["nl"])
+        srv_conf = config.SERVERS.get(server_id, config.SERVERS[get_default_server_id()])
         bot.answer_callback_query(call.id, f"Выполняю {action} для {unit} ({srv_conf['name']})...")
 
         if srv_conf.get("is_local", True):
@@ -1273,7 +1317,7 @@ def handle_all_callbacks(call):
         server_id = parts[1] if len(parts) > 1 else "nl"
         bot.answer_callback_query(call.id, "Обновляю метрики...")
         try:
-            srv = config.SERVERS.get(server_id, config.SERVERS["nl"])
+            srv = config.SERVERS.get(server_id, config.SERVERS[get_default_server_id()])
             msg_text, cpu, ram, swap, disk, sub = format_system_text(server_id)
             photo_buf = card_generator.generate_status_card(cpu, ram, swap, disk, subtitle=sub, title=f"СТАТУС РЕСУРСОВ VPS ({srv['name'].upper()})")
             media = types.InputMediaPhoto(photo_buf, caption=msg_text, parse_mode="Markdown")
@@ -1376,6 +1420,48 @@ def handle_all_callbacks(call):
         bot.answer_callback_query(call.id, "Статус алерта изменен")
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=make_service_alerts_inline())
 
+    elif data == "cfg:links_menu":
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="🔗 **Управление ссылками на сервисы:**\n\nВы можете добавить ссылки на свои сайты, панели управления или Telegram-боты, чтобы быстро переходить к ним из главного меню.",
+            reply_markup=make_links_config_inline(),
+            parse_mode="Markdown"
+        )
+
+    elif data == "cfg_link_add":
+        bot.answer_callback_query(call.id)
+        user_states[call.message.chat.id] = "waiting_for_service_link"
+        bot.send_message(
+            call.message.chat.id,
+            "➕ **Добавление ссылки на сервис**\n\n"
+            "Отправьте сообщение в формате:\n"
+            "`Название | https://url`\n\n"
+            "Примеры:\n"
+            "• `Мой сайт | https://mysite.com`\n"
+            "• `Веб-панель | http://1.2.3.4:8080`\n"
+            "• `Бот поддержки | https://t.me/my_bot`\n\n"
+            "Для отмены отправьте /menu.",
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("cfg_link_del:"):
+        idx_str = data.split(":", 1)[1]
+        try:
+            idx = int(idx_str)
+            links = bot_settings.get("service_links", get_service_links().copy())
+            if 0 <= idx < len(links):
+                removed = links.pop(idx)
+                bot_settings["service_links"] = links
+                save_settings(bot_settings)
+                bot.answer_callback_query(call.id, f"Удалена ссылка: {removed.get('title')}")
+            else:
+                bot.answer_callback_query(call.id, "Ссылка не найдена")
+        except Exception:
+            bot.answer_callback_query(call.id, "Ошибка удаления")
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=make_links_config_inline())
+
     elif data == "cfg:back_main":
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
@@ -1386,10 +1472,49 @@ def handle_all_callbacks(call):
             parse_mode="Markdown"
         )
 
+# --- Функция генерации ежедневного отчета ---
+
+def build_daily_report_text(server_id=None):
+    if not server_id:
+        server_id = get_default_server_id()
+    now_msk = datetime.datetime.now(MSK_TZ)
+    date_str = now_msk.strftime("%d.%m.%Y %H:%M")
+    default_id = get_default_server_id()
+    srv = config.SERVERS.get(server_id, config.SERVERS.get(default_id, {}))
+
+    cpu = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    disk = psutil.disk_usage('/')
+    uptime = maintenance.get_uptime()
+
+    srv_list = srv.get("monitored_services", config.MONITORED_SERVICES)
+    statuses = get_local_systemd_statuses([s["unit"] for s in srv_list])
+    active_count = sum(1 for s in statuses.values() if "🟢" in s)
+    total_count = len(srv_list)
+
+    banned, total, _ = analyzer.get_fail2ban_stats()
+    f2b_str = f"\n• Отражено атак Fail2Ban: `{total}` (в бане: `{banned}`)" if banned is not None else ""
+
+    text = (
+        f"📊 **Ежедневный отчет Server Guard**\n"
+        f"🖥 Сервер: **{srv.get('flag', '🖥')} {srv.get('name', 'Сервер')}**\n"
+        f"📅 `{date_str}` (МСК)\n\n"
+        f"⏱ **Аптайм:** `{uptime}`\n"
+        f"💻 **CPU:** `{cpu:.1f}%`\n"
+        f"🧠 **ОЗУ:** `{ram.percent}%` ({ram.used // (1024**2)} / {ram.total // (1024**2)} МБ)\n"
+        f"💾 **SWAP:** `{swap.percent}%` ({swap.used // (1024**2)} / {swap.total // (1024**2)} МБ)\n"
+        f"💿 **Диск:** `{disk.percent}%` ({disk.free // (1024**3)} ГБ свободно)\n"
+        f"🛠 **Службы:** `{active_count}/{total_count}` активны{f2b_str}\n\n"
+        f"✅ Все системы функционируют стабильно."
+    )
+    return text
+
 # --- Фоновый цикл ---
 
 def monitoring_loop():
     global last_alert_time, last_ssl_check_day, last_backup_date_str
+    last_daily_report_date_str = ""
     high_cpu_counter = 0
     alerted_failed_services = set()
     service_alert_messages = []
@@ -1446,9 +1571,9 @@ def monitoring_loop():
             alerts_map = bot_settings.get("service_alerts_enabled", {})
 
             # 1. Проверка служб Нидерландов
-            nl_units = [srv["unit"] for srv in config.SERVERS["nl"]["monitored_services"]]
+            nl_units = [srv["unit"] for srv in config.SERVERS[get_default_server_id()]["monitored_services"]]
             nl_statuses = get_local_systemd_statuses(nl_units)
-            for srv in config.SERVERS["nl"]["monitored_services"]:
+            for srv in config.SERVERS[get_default_server_id()]["monitored_services"]:
                 unit = srv["unit"]
                 should_alert = alerts_map.get(unit, True)
                 status = nl_statuses.get(unit, "⚪ unknown")
@@ -1529,6 +1654,18 @@ def monitoring_loop():
                     last_backup_date_str = current_date_str
                     for admin_id in config.ADMIN_IDS:
                         backup_manager.send_backup(bot, admin_id)
+
+            # Ежедневный утренний отчет
+            rep_target_time = bot_settings.get("daily_report_time", "09:00")
+            if bot_settings.get("daily_report_enabled", True):
+                if current_time_str == rep_target_time and current_date_str != last_daily_report_date_str:
+                    last_daily_report_date_str = current_date_str
+                    try:
+                        rep_text = build_daily_report_text(get_default_server_id())
+                        notify_admins(rep_text)
+                        log.info("Ежедневный утренний отчет успешно отправлен администраторам")
+                    except Exception as rep_err:
+                        log.error(f"Ошибка при отправке ежедневного отчета: {rep_err}")
 
             if now_msk.day != last_ssl_check_day:
                 last_ssl_check_day = now_msk.day

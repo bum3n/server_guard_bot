@@ -4,29 +4,11 @@
   "filter_system_cpu": true,
   "service_alerts_enabled": {
     "nginx.service": true,
-    "x-ui.service": true,
-    "warp-svc.service": true,
-    "wireproxy.service": true,
-    "antigravity-bot.service": true,
-    "vpn_guard.service": true,
-    "happ-sub-adapter.service": true,
-    "jupyter.service": true,
-    "arcade-hub.service": true,
-    "beszel-hub.service": true,
-    "beszel-agent.service": true,
-    "docker.service": true,
-    "mem_bot.service": true,
-    "flashcard_bot.service": true,
-    "anonchat_bot.service": true,
-    "weektrack.service": true,
+    "ssh.service": true,
     "fail2ban.service": true,
-    "AdGuardHome.service": true,
-    "dns-telemetry.service": true,
-    "realm.service": true,
-    "ufw.service": true,
-    "ssh.service": true
+    "docker.service": true
   },
-  "ssh_alerts_enabled": false,
+  "ssh_alerts_enabled": true,
   "ban_alerts_enabled": false,
   "daily_report_enabled": true,
   "daily_report_time": "09:00",
@@ -35,7 +17,13 @@
   "quiet_end": "08:00",
   "nightly_restart_enabled": false,
   "last_seen_version": "",
-  "backup_hour": 20,
+  "backup_hour": 22,
   "service_alerts": true,
+  "service_links": [
+    {
+      "title": "🌐 Главный сайт",
+      "url": "https://example.com"
+    }
+  ],
   "user_servers": {}
 }
