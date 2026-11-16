@@ -1,4 +1,4 @@
-# 🛡 Server Guard v2.1 — Автономный центр мониторинга и безопасности VPS
+# 🛡 Server Guard v2.1 — Автономный Telegram-Бот для мониторинга и безопасности VPS
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+" />
