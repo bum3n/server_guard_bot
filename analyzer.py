@@ -1,6 +1,8 @@
 import subprocess
 import shutil
 import datetime
+
+MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
 import os
 import time
 
@@ -11,8 +13,6 @@ except ImportError:
 
 def get_fail2ban_stats():
     """Сбор статистики активных банов Fail2Ban."""
-    if not shutil.which("fail2ban-client"):
-        return None, None, []
     try:
         res = subprocess.run(["fail2ban-client", "status", "sshd"], capture_output=True, text=True, timeout=3)
         banned = 0
@@ -32,8 +32,6 @@ def get_fail2ban_stats():
 
 def unban_ip(ip):
     """Разбан конкретного IP-адреса."""
-    if not shutil.which("fail2ban-client"):
-        return "Утилита fail2ban-client не установлена в системе."
     try:
         res = subprocess.run(["fail2ban-client", "set", "sshd", "unbanip", ip], capture_output=True, text=True, timeout=3)
         return "✅ IP успешно разблокирован" if "1" in res.stdout else f"Ответ Fail2Ban: {res.stdout.strip()}"
@@ -43,7 +41,7 @@ def unban_ip(ip):
 def check_ssl_expiry(cert_path=None):
     """Проверка оставшихся дней действия сертификата Let's Encrypt."""
     if not cert_path:
-        domain = getattr(config, "DOMAIN", "localhost") if config else "localhost"
+        domain = getattr(config, "DOMAIN", "bbumn.ru") if config else "bbumn.ru"
         candidate = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
         if os.path.exists(candidate):
             cert_path = candidate
@@ -100,23 +98,28 @@ def renew_ssl():
     except Exception as e:
         msg = f"❌ **Ошибка при обновлении сертификата:** {e}"
     finally:
-        # Гарантированно поднимаем веб-сервер
+        # Гарантированно поднимаем и перезапускаем все веб- и прокси-службы
+        subprocess.run(["systemctl", "restart", "x-ui"], check=False)
         subprocess.run(["systemctl", "start", "nginx"], check=False)
         time.sleep(1.5)
         # Контрольный статус
         ng_st = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True).stdout.strip()
-        msg += f"\n\n🛠 **Статус служб после операции:**\n• Nginx: `{ng_st}`"
+        xui_st = subprocess.run(["systemctl", "is-active", "x-ui"], capture_output=True, text=True).stdout.strip()
+        msg += f"\n\n🛠 **Статус служб после операции:**\n• Nginx: `{ng_st}`\n• 3X-UI: `{xui_st}`"
 
     return msg
 
-def run_speedtest(server_id="main"):
-    """Замер скорости канала VPS (локально или через SSH при мультисерверности)."""
-    srv = config.SERVERS.get(server_id, next(iter(config.SERVERS.values())) if hasattr(config, "SERVERS") and config.SERVERS else {})
-    target_flag = f"{srv.get('flag', '🖥')} {srv.get('name', 'Сервер')}"
-    is_local = srv.get("is_local", True)
+def run_speedtest(server_id="nl"):
+    """Замер скорости канала VPS (локально NL или через SSH на Финляндии / России)."""
+    fin_ip = config.SERVERS.get("fin", {}).get("ip", "1.2.3.5") if hasattr(config, "SERVERS") else "1.2.3.5"
+    ru_ip = config.SERVERS.get("ru", {}).get("ip", "1.2.3.6") if hasattr(config, "SERVERS") else "1.2.3.6"
+    remote_map = {
+        "fin": (f"root@{fin_ip}", "🇫🇮 Финляндия"),
+        "ru": (f"root@{ru_ip}", "🇷🇺 Россия"),
+    }
     try:
-        if not is_local and srv.get("ip"):
-            r_host = f"root@{srv['ip']}"
+        if server_id in remote_map:
+            r_host, target_flag = remote_map[server_id]
             remote_py = "\n".join([
                 "import subprocess, json, shutil",
                 "try:",
@@ -179,20 +182,25 @@ def run_speedtest(server_id="main"):
         client_ip = data.get("client", {}).get("ip", "")
 
 
+        now_msk = datetime.datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S")
         report = (
-            f"🚀 **Результаты замера скорости сети ({target_flag}):**\n\n"
-            f"• **Сервер замера:** {srv_sponsor} ({srv_name}, {srv_country})\n"
-            f"• **IP тестируемого VPS:** `{client_ip}`\n"
-            f"• **Реальная сетевая задержка (Ping):** `{real_ping_ms}`\n"
-            f"• **Скорость загрузки (Download):** `{dl_mbps:.1f} Mbit/s`\n"
-            f"• **Скорость отдачи (Upload):** `{ul_mbps:.1f} Mbit/s`"
+            f"# 🚀 Замер скорости канала: {target_flag}\n\n"
+            f"> — 📅 {now_msk} MSK\n"
+            f"> — IP: `{client_ip}`\n"
+            f"> — Узел: {srv_sponsor} ({srv_name}, {srv_country})\n\n"
+            f"## 📊 Результаты тестирования\n"
+            f"| Показатель | Значение |\n"
+            f"| :--- | :--- |\n"
+            f"| **Загрузка (Download)** | `{dl_mbps:.1f} Mbit/s` ⬇️ |\n"
+            f"| **Отдача (Upload)** | `{ul_mbps:.1f} Mbit/s` ⬆️ |\n"
+            f"| **Задержка (Ping)** | `{real_ping_ms}` ⚡ |\n"
         )
         return report
 
     except subprocess.TimeoutExpired:
-        return "⏱ Время ожидания теста скорости истекло (>65 сек)."
+        return "# ⏱ Таймаут теста скорости\n\n> Время ожидания замера скорости канала истекло (>65 сек)."
     except Exception as e:
-        return f"Ошибка при тесте скорости: {e}"
+        return f"# ❌ Ошибка замера скорости\n\n> `{e}`"
 
 def get_critical_logs(lines=12):
     """Выборка реальных системных инцидентов за последние 24 часа без сетевого мусора."""
@@ -216,7 +224,7 @@ def get_system_summary():
         load_avg = "н/д"
     
     banned, total, _ = get_fail2ban_stats()
-    return f"• **Load Average (1/5/15 мин):** `{load_avg}`\n• **Защита SSH:** Активно: `{banned}` (Всего: `{total}`)"
+    return f"- **Load Average (1/5/15 мин):** `{load_avg}`\n- **Защита SSH:** Активно: `{banned}` (Всего: `{total}`)"
 
 def flush_swap():
     """Безопасная выгрузка SWAP в ОЗУ (swapoff -a && swapon -a)."""

@@ -6,8 +6,8 @@ import subprocess
 log = logging.getLogger(__name__)
 
 REMOTE_HOSTS = {
-    "fin": "root@201.58.188.206",
-    "ru": "root@62.173.152.111",
+    "fin": "root@1.2.3.5",
+    "ru": "root@1.2.3.6",
 }
 REMOTE_HOST = REMOTE_HOSTS["fin"]
 
@@ -16,6 +16,7 @@ SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=6",
     "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "LogLevel=ERROR",
 ]
 
 
@@ -100,18 +101,30 @@ def get_remote_systemd_statuses(unit_names, server_id="fin"):
         return {}
     host = _get_host(server_id)
     units_arg = " ".join(unit_names)
-    cmd = f"systemctl is-active {units_arg}"
+    cmd = f'for u in {units_arg}; do printf "%s=%s\\n" "$u" "$(systemctl is-active "$u" 2>/dev/null)"; done'
     try:
         full_cmd = SSH_OPTS + [host, cmd]
         res = subprocess.run(full_cmd, capture_output=True, text=True, timeout=10)
-        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
-        result = {}
-        for i, u in enumerate(unit_names):
-            if i < len(lines):
-                st = lines[i]
-                result[u] = "🟢 active" if st == "active" else f"🔴 {st}"
-            else:
-                result[u] = "⚪ unknown"
+        if res.returncode != 0 and not res.stdout.strip():
+            log.warning(f"Ошибка проверки статусов служб на {host}: rc={res.returncode}, stderr={res.stderr.strip()}")
+            return {u: "⚪ unknown" for u in unit_names}
+
+        result = {u: "⚪ unknown" for u in unit_names}
+        for line in res.stdout.strip().splitlines():
+            line = line.strip()
+            if "=" in line:
+                u, st = line.split("=", 1)
+                u = u.strip()
+                st = st.strip()
+                if u in result:
+                    if st == "active":
+                        result[u] = "🟢 active"
+                    elif st in ("inactive", "failed", "deactivating"):
+                        result[u] = f"🔴 {st}"
+                    elif st in ("activating", "reloading"):
+                        result[u] = f"🔄 {st}"
+                    elif st:
+                        result[u] = f"🔴 {st}"
         return result
     except Exception as e:
         log.warning(f"Ошибка проверки статусов служб на {host}: {e}")
@@ -219,6 +232,10 @@ def get_remote_top_procs(mode="cpu", limit=6, server_id="fin"):
             desc = "Системный процесс"
             if "realm" in name_lower or "/etc/realm" in cmd_str:
                 desc = "Ретранслятор Realm Relay (RU➔NL/FI)"
+            elif "smartdns" in cmd_str or "smartdns-relay" in name_lower:
+                desc = "Релей SmartDNS UDP/TCP (RU➔FIN)"
+            elif "xray-warp" in cmd_str or "xray-warp" in name_lower:
+                desc = "Xray YouTube Egress (WARP)"
             elif "adguard" in name_lower or "adguard" in cmd_str:
                 desc = "Блокировщик AdGuard Home DNS"
             elif "dns_telemetry" in cmd_str or "telemetry" in cmd_str:
@@ -233,6 +250,10 @@ def get_remote_top_procs(mode="cpu", limit=6, server_id="fin"):
                 desc = "Защита от брутфорса Fail2ban"
             elif "beszel-agent" in name_lower or "beszel" in cmd_str:
                 desc = "Агент мониторинга Beszel"
+            elif "dockerd" in name_lower or "docker" in name_lower:
+                desc = "Служба Docker (Zapret 2 / Контейнеры)"
+            elif "ufw" in name_lower or "ufw" in cmd_str:
+                desc = "Межсетевой экран UFW"
             elif "sshd" in name_lower:
                 desc = "Служба SSH-доступа"
             elif "systemd-resolve" in name_lower:
@@ -301,14 +322,35 @@ def get_remote_critical_logs(lines=15, server_id="fin"):
 def check_remote_tcp_ports(ports, host, timeout=1.8):
     """Проверяет доступность проброшенных портов на внешнем IP ретранслятора."""
     results = []
+    try:
+        import socks
+    except ImportError:
+        socks = None
+
     for item in ports:
         p = item["port"]
         name = item["name"]
-        try:
-            with socket.create_connection((host, int(p)), timeout=timeout):
-                results.append((name, "🟢 open"))
-        except Exception:
-            results.append((name, "🔴 closed"))
+        opened = False
+        # Для RU Relay используем локальный SOCKS5 WARP прокси (127.0.0.1:40000), если прямой TCP блокируется
+        if host in ("1.2.3.6", "1.2.3.7") and socks:
+            try:
+                s = socks.socksocket()
+                s.set_proxy(socks.SOCKS5, "127.0.0.1", 40000)
+                s.settimeout(timeout)
+                s.connect((host, int(p)))
+                s.close()
+                opened = True
+            except Exception:
+                opened = False
+
+        if not opened:
+            try:
+                with socket.create_connection((host, int(p)), timeout=timeout):
+                    opened = True
+            except Exception:
+                opened = False
+
+        results.append((name, "🟢 open" if opened else "🔴 closed"))
     return results
 
 
